@@ -239,11 +239,15 @@ bool wait_registered(EventQueue& events, Clock::time_point start) {
 void print_stats(ketphone_engine* engine) {
   ketphone_media_stats stats{};
   ketphone_media_stats_get(engine, &stats);
-  std::printf("media sent=%llu received=%llu lost=%llu late=%llu concealed=%llu jitter_ms=%.2f\n",
+  std::printf(
+      "media sent=%llu received=%llu lost=%llu late=%llu concealed=%llu expanded=%llu dropped=%llu jitter_ms=%.2f "
+      "playout_delay_ms=%.1f\n",
               static_cast<unsigned long long>(stats.packets_sent),
               static_cast<unsigned long long>(stats.packets_received),
               static_cast<unsigned long long>(stats.packets_lost), static_cast<unsigned long long>(stats.packets_late),
-              static_cast<unsigned long long>(stats.frames_concealed), stats.jitter_ms);
+              static_cast<unsigned long long>(stats.frames_concealed),
+              static_cast<unsigned long long>(stats.frames_expanded),
+              static_cast<unsigned long long>(stats.frames_dropped), stats.jitter_ms, stats.playout_delay_ms);
 }
 
 // Runs media until the deadline or until the call ends; returns true when the far end hung up.

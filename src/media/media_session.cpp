@@ -11,8 +11,8 @@ constexpr size_t kConcealRepeats = 3;
 
 }  // namespace
 
-MediaSession::MediaSession(SpscRing<int16_t>& capture, SpscRing<int16_t>& playout, size_t jitter_frames)
-    : capture_(capture), playout_(playout), jitter_(jitter_frames) {
+MediaSession::MediaSession(SpscRing<int16_t>& capture, SpscRing<int16_t>& playout, int64_t initial_delay_us)
+    : capture_(capture), playout_(playout), jitter_(initial_delay_us) {
   frame_.reserve(kFrameSamples);
 }
 
@@ -50,7 +50,7 @@ size_t MediaSession::next_packet(std::span<uint8_t> out) {
   return size;
 }
 
-void MediaSession::on_packet(std::span<const uint8_t> datagram, uint32_t arrival) {
+void MediaSession::on_packet(std::span<const uint8_t> datagram, int64_t arrival_us) {
   const auto packet = parse_rtp(datagram);
   if (!packet || packet->header.payload_type != sip::kPayloadPcma) return;  // DTMF and comfort noise ignored
   if (!have_remote_ssrc_ || packet->header.ssrc != remote_ssrc_) {
@@ -60,14 +60,17 @@ void MediaSession::on_packet(std::span<const uint8_t> datagram, uint32_t arrival
     receive_ = ReceiveStatistics{};
     jitter_.reset();
   }
-  const int64_t sequence = receive_.on_packet(packet->header.sequence, packet->header.timestamp, arrival);
+  // RFC 3550 jitter is computed in RTP timestamp units (1/8000 s); wrapping is harmless there.
+  const auto arrival_rtp = static_cast<uint32_t>(arrival_us * 8 / 1000);
+  const int64_t sequence = receive_.on_packet(packet->header.sequence, packet->header.timestamp, arrival_rtp);
   ++stats_.packets_received;
-  if (jitter_.put(sequence, packet->payload) == JitterBuffer::PutResult::Late) ++stats_.packets_late;
+  if (jitter_.put(sequence, packet->payload, arrival_us) == JitterBuffer::PutResult::Late) ++stats_.packets_late;
 }
 
-void MediaSession::play_frame() {
+void MediaSession::play_frame(int64_t now_us) {
   std::array<int16_t, kFrameSamples> samples{};
-  switch (jitter_.pop(frame_)) {
+  const auto result = jitter_.pop(frame_, now_us);
+  switch (result) {
     case JitterBuffer::PopResult::Played: {
       const size_t count = std::min(frame_.size(), samples.size());
       alaw_decode(frame_.data(), count, samples.data());
@@ -76,7 +79,8 @@ void MediaSession::play_frame() {
       break;
     }
     case JitterBuffer::PopResult::Missing:
-      ++stats_.frames_concealed;
+    case JitterBuffer::PopResult::Expanded:
+      if (result == JitterBuffer::PopResult::Missing) ++stats_.frames_concealed;
       if (concealed_in_a_row_ < kConcealRepeats) {
         for (auto& sample : last_played_) sample = static_cast<int16_t>(sample / 2);
         samples = last_played_;
@@ -93,6 +97,9 @@ MediaStats MediaSession::stats() const {
   MediaStats stats = stats_;
   stats.packets_lost = receive_.lost();
   stats.jitter_ms = receive_.jitter() / 8.0;
+  stats.frames_expanded = jitter_.expanded();
+  stats.frames_dropped = jitter_.dropped();
+  stats.playout_delay_ms = static_cast<double>(jitter_.target_delay_us()) / 1000.0;
   return stats;
 }
 
