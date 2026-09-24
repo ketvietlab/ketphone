@@ -11,7 +11,7 @@ The core speaks only standard SIP/RTP and knows nothing about any particular bac
 - REGISTER uses MD5 digest with `qop=auth` and refreshes at half the granted lifetime.
 - INVITE/ACK/BYE/CANCEL/OPTIONS for both outgoing and incoming calls, with the RFC 3261 retransmission timers.
 - Single-stream audio SDP: PCMA (payload type 8) and telephone-event 101, ptime 20 ms.
-- Symmetric RTP. Receive statistics follow RFC 3550 (loss, jitter); a fixed-delay jitter buffer with simple loss concealment.
+- Symmetric RTP. Receive statistics follow RFC 3550 (loss, jitter); an adaptive jitter buffer (see below) with simple loss concealment.
 - The realtime audio thread touches only two lock-free ring buffers: no allocation, no locks, no logging.
 
 Not in this version: SRTP, Opus, RTCP, outgoing DTMF, TCP/TLS, and ICE/STUN (internal calls run over Tailscale, so they are not needed yet). There is no echo cancellation in the core; on iOS the app uses VoiceProcessingIO.
@@ -107,7 +107,18 @@ Results on 24 September 2026 (local Asterisk 20.20, 60 ms jitter buffer, 10 seco
 
 ¹ Includes 500 ms the callee deliberately waits before answering.
 
-Almost all of the round trip is buffering: 60 ms of jitter buffer, 20 ms of send pacing and the simulated device's 20 ms frame, for each end the audio passes through. The network contributes next to nothing.
+These were measured with the earlier fixed 60 ms jitter buffer. Almost all of the round trip was buffering: 60 ms of jitter buffer, 20 ms of send pacing and the simulated device's 20 ms frame, for each end the audio passes through. The network contributed next to nothing. With the adaptive buffer the echo test's round trip drops to 80 ms.
+
+## Jitter buffer
+
+The buffer ([`src/media/jitter_buffer.hpp`](src/media/jitter_buffer.hpp)) sizes itself from what it measures instead of holding a fixed delay:
+
+- Each frame's transit (arrival time minus the send time implied by its sequence number) goes into a five second window. The target delay is the spread from the fastest transit to the 99th percentile, plus a 10 ms margin, capped at 300 ms. Late frames count too, since they are the evidence that the delay is too short. `jitter_buffer_ms` only sets the delay for the first second, before there is enough to measure.
+- Playout moves towards the target one frame at a time. It grows by repeating a frame. It shrinks by passing over a slot whose frame was lost, which costs no audio, or else by discarding one frame at most every 200 ms.
+- When the buffer has run dry and a frame arrives after its slot (the path got slower), playout steps back to that frame instead of dropping it. A delay step therefore costs only the frames in the gap.
+- Clock drift between the two ends is corrected the same way, by an occasional repeated or skipped frame. Because transit is measured against sequence numbers, drift also widens the measured spread: 0.1% over the window adds 5 ms.
+
+`ketphone_media_stats` reports `frames_expanded`, `frames_dropped` and the current `playout_delay_ms`.
 
 ## Simulating a poor network
 
@@ -119,23 +130,23 @@ Two complementary tools.
 KETPHONE_PASSWORD='...' scripts/netem-matrix
 ```
 
-Results on 24 September 2026 (20 second calls, 60 ms jitter buffer):
+Results on 24 September 2026 (20 second calls), first with the earlier fixed 60 ms buffer and then with the adaptive buffer (two runs each; the adaptive runs agreed within the ranges shown):
 
-| Profile (egress) | Register | Answer | Lost | Late | Concealed | Jitter | Echo median / max |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| clean network | 15 ms | 5 ms | 0 | 0 | 0 | 1.5 ms | 100 / 100 ms |
-| relay path: 70 ms ±5 | 148 ms | 144 ms | 0 | 0 | 0 | 3.6 ms | 160 / 160 ms |
-| 4G: 40 ms ±20, 1% loss | 91 ms | 120 ms | 10 | 28 | 38 (3.8%) | 20.9 ms | 120 / 140 ms |
-| poor Wi-Fi: 30 ms ±40 pareto, 3% loss | 69 ms | 12 ms | 32 | 24 | 56 (5.6%) | 29 ms | 160 / 180 ms |
+| Profile (egress) | Lost | Late: fixed → adaptive | Concealed: fixed → adaptive | Adaptive target | Echo median: fixed → adaptive |
+| --- | --- | --- | --- | --- | --- |
+| clean network | 0 | 0 → 0 | 0 → 0 | 16–19 ms | 100 → 80 ms |
+| relay path: 70 ms ±5 | 0 | 0 → 0 | 0 → 0 | 24 ms | 160 → 140–160 ms |
+| 4G: 40 ms ±20, 1% loss | 6–10 | 1–28 → 1 | 5–38 → 8–9 | 98 ms | 120–140 → 160 ms |
+| poor Wi-Fi: 30 ms ±40 pareto, 3% loss | 32–39 | 24–33 → 4–5 | 49–56 → 40 | 130–150 ms | 120–160 → 260 ms |
 
+- On clean paths the adaptive buffer is 40 ms shorter than the fixed one. On jittery paths it trades latency for completeness: almost everything it conceals is real loss. Pareto jitter has a long tail, so the 99th percentile target gets long; 260 ms round trip is about 130 ms each way, still inside the ITU-T G.114 150 ms guideline.
+- The fixed buffer's results varied widely between runs of the same profile (1 or 28 late frames under 4G), because its headroom depended on how fast the first frames happened to arrive. The adaptive buffer's did not.
 - Registration costs two round trips (the 401 challenge, then the retry), so a slow path delays the start of every call in proportion.
-- Late frames can outnumber lost ones. In a second 4G run the same profile produced 1 late frame instead of 28: the fixed buffer's headroom depends on how fast the first frames happened to arrive.
-- Concealing 4–6% of frames by repeating the previous one is audible. G.711 copes well up to roughly 1–2%.
 
-**Deterministically, in the unit tests.** [`tests/network_simulation_test.cpp`](tests/network_simulation_test.cpp) drives the jitter buffer with a simulated sender and link on a virtual clock, so every scenario is exact and repeatable. It pins down the current buffer's behaviour, which an adaptive buffer has to improve on:
+**Deterministically, in the unit tests.** [`tests/network_simulation_test.cpp`](tests/network_simulation_test.cpp) drives the jitter buffer with a simulated sender and link on a virtual clock, so every scenario is exact and repeatable. The scenarios are constant delay, jitter of 45 and 80 ms with the worst possible start, a delay step up and down, 3% loss, reordering, and clock drift both ways. Among them are the two cases the fixed buffer handled badly:
 
-- The nominal 60 ms buffer (3 frames) tolerates only about 40 ms of jitter plus the wait for the next tick, because playout starts as soon as the third frame is in.
-- A delay step larger than that headroom (a route change) makes every frame late until the buffer gives up after ten missing frames and starts over.
+- It tolerated only about 40 ms of jitter, not 60, because playout started as soon as the third frame was in. The adaptive buffer absorbs 45 ms of jitter with under 1% late frames.
+- A delay step larger than that headroom made every frame late until ten had been missed. Now it costs only the frames in the gap.
 
 ## Licence
 

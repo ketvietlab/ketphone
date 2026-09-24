@@ -58,9 +58,8 @@ ketphone_end_reason to_c(EndReason reason) {
 }
 
 // RTP timestamp units (1/8000 s) since an arbitrary origin, wrapping like RTP timestamps do.
-uint32_t rtp_clock(TimePoint now) {
-  const auto micros = std::chrono::duration_cast<std::chrono::microseconds>(now.time_since_epoch()).count();
-  return static_cast<uint32_t>(static_cast<uint64_t>(micros) * 8 / 1000);
+int64_t micros(TimePoint time) {
+  return std::chrono::duration_cast<std::chrono::microseconds>(time.time_since_epoch()).count();
 }
 
 std::string or_default(const char* value, std::string fallback) {
@@ -96,9 +95,8 @@ class Engine final : public UserAgentHost {
     ua.correlation_header = or_default(config.correlation_header, {});
 
     const uint32_t jitter_ms = config.jitter_buffer_ms != 0 ? config.jitter_buffer_ms : 60;
-    const size_t jitter_frames = std::max<size_t>(1, (jitter_ms + 10) / 20);
 
-    auto engine = std::unique_ptr<Engine>(new Engine(std::move(ua), std::move(*sip), jitter_frames, callback, context));
+    auto engine = std::unique_ptr<Engine>(new Engine(std::move(ua), std::move(*sip), int64_t{jitter_ms} * 1000, callback, context));
     if (!engine->start()) return nullptr;
     return engine;
   }
@@ -180,6 +178,9 @@ class Engine final : public UserAgentHost {
     out.packets_late = stats_.packets_late;
     out.frames_concealed = stats_.frames_concealed;
     out.jitter_ms = stats_.jitter_ms;
+    out.frames_expanded = stats_.frames_expanded;
+    out.frames_dropped = stats_.frames_dropped;
+    out.playout_delay_ms = stats_.playout_delay_ms;
     return out;
   }
 
@@ -216,12 +217,12 @@ class Engine final : public UserAgentHost {
   }
 
  private:
-  Engine(UserAgentConfig config, net::UdpSocket sip, size_t jitter_frames, ketphone_event_callback callback,
+  Engine(UserAgentConfig config, net::UdpSocket sip, int64_t initial_delay_us, ketphone_event_callback callback,
          void* context)
       : sip_(std::move(sip)),
         capture_(kRingSamples),
         playout_(kRingSamples),
-        media_(capture_, playout_, jitter_frames),
+        media_(capture_, playout_, initial_delay_us),
         ua_(std::move(config), *this),
         callback_(callback),
         context_(context) {
@@ -333,7 +334,7 @@ class Engine final : public UserAgentHost {
       while (rtp_ && media_.active()) {
         const auto size = rtp_->receive(buffer);
         if (!size || *size == 0) break;
-        media_.on_packet({buffer.data(), *size}, rtp_clock(Clock::now()));
+        media_.on_packet({buffer.data(), *size}, micros(Clock::now()));
       }
 
       now = Clock::now();
@@ -347,7 +348,7 @@ class Engine final : public UserAgentHost {
           std::array<uint8_t, media::kMaxPacketSize> packet{};
           const size_t size = media_.next_packet(packet);
           if (size > 0) rtp_->send_to({packet.data(), size}, rtp_remote_);
-          media_.play_frame();
+          media_.play_frame(micros(next_frame_));
           next_frame_ += kFrame;
         }
         publish_stats();

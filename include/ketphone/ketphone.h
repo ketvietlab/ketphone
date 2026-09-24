@@ -105,7 +105,8 @@ typedef struct ketphone_config {
   const char *password;
   /* Seconds to ask for in REGISTER; 0 means 300. */
   uint32_t register_expires;
-  /* Target playout delay of the jitter buffer; 0 means 60 ms. Rounded to 20 ms frames. */
+  /* Playout delay of the jitter buffer until a second of jitter has been measured; 0 means 60 ms.
+   * After that the buffer adapts to the measured jitter, between 10 and 300 ms. */
   uint32_t jitter_buffer_ms;
   /* Sent as User-Agent; NULL means "KetPhone/<version>". */
   const char *user_agent;
@@ -125,6 +126,12 @@ typedef struct ketphone_media_stats {
   uint64_t frames_concealed;
   /* RFC 3550 interarrival jitter. */
   double jitter_ms;
+  /* Frames repeated to grow the playout delay when jitter rose. */
+  uint64_t frames_expanded;
+  /* Frames discarded to shrink the playout delay when jitter fell. */
+  uint64_t frames_dropped;
+  /* How long the fastest packets wait before playout, as the jitter buffer currently aims for. */
+  double playout_delay_ms;
 } ketphone_media_stats;
 
 /* Library version, e.g. "0.1.0". */
