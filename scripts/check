@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Local gate: warnings as errors, AddressSanitizer + UndefinedBehaviorSanitizer, unit tests.
+# This is the acceptance check; there is no hosted CI for this repository yet.
+set -euo pipefail
+
+root="$(cd "$(dirname "$0")/.." && pwd)"
+build="$root/build/check"
+
+cmake -S "$root" -B "$build" -G Ninja \
+  -DCMAKE_BUILD_TYPE=Debug \
+  -DKETPHONE_WERROR=ON \
+  -DKETPHONE_SANITIZE=ON
+cmake --build "$build"
+ctest --test-dir "$build" --output-on-failure
+
+# A release build catches warnings that only appear with optimisation.
+release="$root/build/release"
+cmake -S "$root" -B "$release" -G Ninja -DCMAKE_BUILD_TYPE=Release -DKETPHONE_WERROR=ON
+cmake --build "$release"
+ctest --test-dir "$release" --output-on-failure
+
+echo "check: ok"
