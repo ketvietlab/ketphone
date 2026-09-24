@@ -19,4 +19,9 @@ cmake -S "$root" -B "$release" -G Ninja -DCMAKE_BUILD_TYPE=Release -DKETPHONE_WE
 cmake --build "$release"
 ctest --test-dir "$release" --output-on-failure
 
+# The Swift package builds the same sources for Apple platforms, with its own tests.
+if [[ "$(uname)" == "Darwin" ]]; then
+  swift test --package-path "$root"
+fi
+
 echo "check: ok"

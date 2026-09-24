@@ -26,6 +26,7 @@ src/net/                      non-blocking UDP socket
 src/core/user_agent.*         SIP state machine: no sockets, no clock, fully testable
 src/core/engine.cpp           network thread + C API
 tools/ketphone-poc/           measurement tool, uses only the C API
+platform/apple/               Swift package: Swift API, VoiceProcessingIO audio (C), tests
 tests/                        unit tests, network simulation, C API over loopback UDP
 scripts/                      local gate and network impairment runs
 ```
@@ -38,7 +39,32 @@ Requires CMake ≥ 3.24, Ninja and a C++20 compiler (Apple clang, or clang/gcc o
 scripts/check
 ```
 
-`scripts/check` is the local acceptance gate. It builds Debug with `-Werror`, AddressSanitizer and UndefinedBehaviorSanitizer and runs the tests, then builds Release and runs them again. There is no hosted CI yet.
+`scripts/check` is the local acceptance gate. It builds Debug with `-Werror`, AddressSanitizer and UndefinedBehaviorSanitizer and runs the tests, then builds Release and runs them again. There is no hosted CI yet. On macOS it also runs the Swift package tests.
+
+## Using it from Swift (iOS and macOS)
+
+`Package.swift` builds the same sources for Apple platforms, so an app adds this repository as a Swift package dependency and imports `KetPhone`:
+
+```swift
+import KetPhone
+
+let engine = try Engine(configuration: Configuration(
+  serverHost: "pbx.example.com", extension: "1001", password: password,
+  correlationHeader: "X-KV-Call-Id"))
+try engine.register()
+for await event in engine.events {
+  if case .registration(statusCode: 200) = event { _ = try engine.call("*43") }
+}
+```
+
+- `Engine.events` is an `AsyncStream` of registration and call events. The engine hangs up and unregisters when it is released.
+- `startAudio()` and `stopAudio()` run a VoiceProcessingIO unit at 8 kHz, which gives Apple's echo cancellation, noise suppression and gain control. The audio callbacks are written in C (`platform/apple/audio`) so the realtime thread never enters the Swift runtime.
+- The app owns the audio session. With CallKit, configure it as `playAndRecord` with mode `voiceChat`, and call `startAudio()` from `provider(_:didActivate:)`.
+
+```bash
+swift test                                                   # macOS
+xcodebuild -scheme KetPhone -destination 'generic/platform=iOS' build
+```
 
 ## Trying it against a local Asterisk
 
