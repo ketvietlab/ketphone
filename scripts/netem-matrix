@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# Calls a SIP echo target from a Linux container under several simulated network profiles
+# (tc netem) and prints the result lines of ketphone-poc for each.
+#
+# The container needs NET_ADMIN, iproute2 and a ketphone-poc build; see README.md. netem shapes
+# the container's egress only, so each profile's delay is paid once per round trip.
+#
+#   KETPHONE_PASSWORD=... scripts/netem-matrix
+#
+# Environment: KETPHONE_PASSWORD (required), KETPHONE_CONTAINER (ketphone-linux-poc),
+# KETPHONE_POC (/tmp/b/ketphone-poc), KETPHONE_SERVER (172.29.73.10), KETPHONE_USER (1001),
+# KETPHONE_TARGET (*43), KETPHONE_SECONDS (20).
+set -euo pipefail
+
+: "${KETPHONE_PASSWORD:?set KETPHONE_PASSWORD to the SIP password}"
+container="${KETPHONE_CONTAINER:-ketphone-linux-poc}"
+poc="${KETPHONE_POC:-/tmp/b/ketphone-poc}"
+server="${KETPHONE_SERVER:-172.29.73.10}"
+user="${KETPHONE_USER:-1001}"
+target="${KETPHONE_TARGET:-*43}"
+seconds="${KETPHONE_SECONDS:-20}"
+
+names=(
+  "clean network"
+  "relay path: 70 ms +-5"
+  "4G: 40 ms +-20, 1% loss"
+  "poor Wi-Fi: 30 ms +-40 pareto, 3% loss"
+)
+profiles=(
+  ""
+  "delay 70ms 5ms"
+  "delay 40ms 20ms distribution normal loss 1%"
+  "delay 30ms 40ms distribution pareto loss 3%"
+)
+
+clear_netem() { docker exec "$container" tc qdisc del dev eth0 root 2>/dev/null || true; }
+trap clear_netem EXIT
+
+status=0
+for i in "${!profiles[@]}"; do
+  clear_netem
+  if [[ -n "${profiles[$i]}" ]]; then
+    # shellcheck disable=SC2086 # the profile is a list of tc arguments
+    docker exec "$container" tc qdisc add dev eth0 root netem ${profiles[$i]}
+  fi
+  echo "== ${names[$i]}"
+  output="$(docker exec -e KETPHONE_PASSWORD "$container" "$poc" --server "$server" --user "$user" \
+    --call "$target" --seconds "$seconds")" || { echo "  ketphone-poc exited with $?"; status=1; }
+  while IFS= read -r line; do
+    case "$line" in register* | answered* | media* | echo*) echo "  $line" ;; esac
+  done <<<"$output"
+done
+exit "$status"
