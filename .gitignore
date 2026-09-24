@@ -3,3 +3,5 @@
 compile_commands.json
 .DS_Store
 *.env
+/.build/
+/.swiftpm/
