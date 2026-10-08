@@ -41,7 +41,24 @@ TEST(rejects_descriptions_without_usable_audio) {
   CHECK(!parse_audio("v=0\r\nc=IN IP4 1.2.3.4\r\nm=video 4000 RTP/AVP 96\r\n").has_value());
   CHECK(!parse_audio("v=0\r\nm=audio 4000 RTP/AVP 8\r\n").has_value());  // no connection address
   CHECK(!parse_audio("v=0\r\nc=IN IP4 1.2.3.4\r\nm=audio 4000 RTP/SAVP 8\r\n").has_value());
-  CHECK(!parse_audio("v=0\r\nc=IN IP6 ::1\r\nm=audio 4000 RTP/AVP 8\r\n").has_value());
+  CHECK(!parse_audio("v=0\r\nc=IN IP7 ::1\r\nm=audio 4000 RTP/AVP 8\r\n").has_value());
+}
+
+TEST(ipv6_sdp_offer_and_media_override_round_trip) {
+  const std::string offer = build_audio_sdp("2001:db8::1234", 40000, 7, 2);
+  CHECK(offer.find("o=- 7 2 IN IP6 2001:db8::1234\r\n") != std::string::npos);
+  CHECK(offer.find("c=IN IP6 2001:db8::1234\r\n") != std::string::npos);
+  const auto audio = parse_audio(offer);
+  CHECK(audio.has_value());
+  CHECK_EQ(audio->address, std::string("2001:db8::1234"));
+  CHECK_EQ(audio->port, uint16_t{40000});
+  CHECK(audio->offers_pcma());
+  const auto override = parse_audio("v=0\r\nc=IN IP4 192.0.2.1\r\nm=audio 5000 RTP/AVP 8\r\nc=IN IP6 ::1\r\n");
+  CHECK(override.has_value());
+  CHECK_EQ(override->address, std::string("::1"));
+  CHECK(!parse_audio("v=0\r\nc=IN IP4 192.0.2.1\r\nm=audio 5000 RTP/AVP 8\r\nc=IN IP7 ::1\r\n"));
+  CHECK(!parse_audio("v=0\r\nc=IN IP6 \r\nm=audio 5000 RTP/AVP 8\r\n"));
+  CHECK(!parse_audio("v=0\r\nc=IN IP6 [::1]\r\nm=audio 5000 RTP/AVP 8\r\n"));
 }
 
 TEST(built_offer_round_trips) {

@@ -97,7 +97,8 @@ typedef void (*ketphone_event_callback)(const ketphone_event *event, void *conte
 typedef struct ketphone_config {
   /* Set to sizeof(ketphone_config); lets later versions add fields without breaking callers. */
   uint32_t struct_size;
-  /* Host name or IPv4 address of the SIP server. Also used as the SIP domain. */
+  /* Host name or unbracketed IPv4/IPv6 address of the SIP server. Also used as the SIP domain.
+   * Prefer a DNS name so the system resolver can use DNS64/NAT64 on IPv6-only networks. */
   const char *server_host;
   /* 0 means 5060. */
   uint16_t server_port;

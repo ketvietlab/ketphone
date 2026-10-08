@@ -72,6 +72,28 @@ const std::string kAnswer =
     "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=Asterisk\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n"
     "m=audio 10002 RTP/AVP 8 101\r\na=rtpmap:8 PCMA/8000\r\na=sendrecv\r\n";
 
+TimePoint t0() { return TimePoint{} + 1h; }
+
+TEST(ipv6_sip_uris_via_contact_and_digest_use_bracketed_hosts) {
+  auto cfg = config();
+  cfg.domain = "2001:db8::1";
+  cfg.local_address = "2001:db8::2";
+  FakeHost host;
+  UserAgent ua(cfg, host);
+  ua.start_registration(t0());
+  const auto registration = host.last();
+  CHECK_EQ(registration.uri, std::string("sip:[2001:db8::1]"));
+  CHECK(registration.header("via")->starts_with("SIP/2.0/UDP [2001:db8::2]:50000;"));
+  CHECK_EQ(std::string(*registration.header("contact")), std::string("<sip:1001@[2001:db8::2]:50000;transport=udp>"));
+  CHECK(registration.header("from")->find("sip:1001@[2001:db8::1]") != std::string_view::npos);
+  ua.on_message(respond(registration, 401, kChallenge), t0());
+  CHECK(host.last().header("authorization")->find("uri=\"sip:[2001:db8::1]\"") != std::string_view::npos);
+  CHECK(ua.call(1, "1002", t0()) == CommandResult::Ok);
+  const auto invite = host.last();
+  CHECK_EQ(invite.uri, std::string("sip:1002@[2001:db8::1]"));
+  CHECK(invite.body.find("c=IN IP6 2001:db8::2\r\n") != std::string::npos);
+}
+
 // Checks the digest in an Authorization header the way Asterisk does.
 bool digest_valid(const std::string& header_value, const std::string& method) {
   // The challenge parser reads key="value" pairs, which gives realm and nonce back.
@@ -93,8 +115,6 @@ bool digest_valid(const std::string& header_value, const std::string& method) {
   challenge.qop_auth = !cnonce.empty();
   return sip::digest_response({"1001", "secret"}, challenge, method, uri, nc, cnonce) == response;
 }
-
-TimePoint t0() { return TimePoint{} + 1h; }
 
 std::vector<Event> events_of(UserAgent& ua, EventKind kind) {
   std::vector<Event> out;
