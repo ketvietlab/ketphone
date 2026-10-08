@@ -61,6 +61,7 @@ if(KETPHONE_BUILD_TESTS)
     tests/jitter_buffer_test.cpp
     tests/message_test.cpp
     tests/network_simulation_test.cpp
+    tests/ipv6_test.cpp
     tests/rtp_test.cpp
     tests/sdp_test.cpp
     tests/spsc_ring_test.cpp

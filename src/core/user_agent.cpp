@@ -36,6 +36,12 @@ std::string branch_of(const sip::Message& message) {
   return sip::param_of(top, "branch").value_or("");
 }
 
+// RFC 3261 requires brackets around IPv6 literals in SIP URIs and Via sent-by.
+std::string sip_host(const std::string& address) {
+  if (address.find(':') != std::string::npos && !address.starts_with('[')) return "[" + address + "]";
+  return address;
+}
+
 }  // namespace
 
 UserAgent::UserAgent(UserAgentConfig config, UserAgentHost& host) : config_(std::move(config)), host_(host) {
@@ -46,15 +52,15 @@ UserAgent::UserAgent(UserAgentConfig config, UserAgentHost& host) : config_(std:
   allocate_call_id = [next]() mutable { return next++; };
 }
 
-std::string UserAgent::aor() const { return "sip:" + config_.extension + "@" + config_.domain; }
+std::string UserAgent::aor() const { return "sip:" + config_.extension + "@" + sip_host(config_.domain); }
 
 std::string UserAgent::contact() const {
-  return "<sip:" + config_.extension + "@" + config_.local_address + ":" + std::to_string(config_.local_port) +
+  return "<sip:" + config_.extension + "@" + sip_host(config_.local_address) + ":" + std::to_string(config_.local_port) +
          ";transport=udp>";
 }
 
 std::string UserAgent::via(const std::string& branch) const {
-  return "SIP/2.0/UDP " + config_.local_address + ":" + std::to_string(config_.local_port) + ";branch=" + branch +
+  return "SIP/2.0/UDP " + sip_host(config_.local_address) + ":" + std::to_string(config_.local_port) + ";branch=" + branch +
          ";rport";
 }
 
@@ -150,7 +156,7 @@ void UserAgent::stop_registration(TimePoint now) {
 void UserAgent::send_register(uint32_t expires, const std::string& authorization, TimePoint now) {
   Request request;
   request.method = "REGISTER";
-  request.uri = "sip:" + config_.domain;
+  request.uri = "sip:" + sip_host(config_.domain);
   request.from = "<" + aor() + ">;tag=" + registration_.from_tag;
   request.to = "<" + aor() + ">";
   request.call_id = registration_.call_id;
@@ -172,7 +178,7 @@ void UserAgent::on_register_final(const sip::Message* response, uint32_t expires
   registration_.in_flight = false;
   const int32_t status = response ? response->status : 408;
   if (response && (status == 401 || status == 407) && !authenticated) {
-    if (const auto authorization = authorization_for(*response, "REGISTER", "sip:" + config_.domain)) {
+    if (const auto authorization = authorization_for(*response, "REGISTER", "sip:" + sip_host(config_.domain))) {
       send_register(expires, *authorization, now);
       return;
     }
@@ -226,7 +232,7 @@ CommandResult UserAgent::call(int32_t call_id, const std::string& target, TimePo
   call.state = CallState::Calling;
   call.sip_call_id = sip::random_hex(12) + "@ketphone";
   call.local_tag = sip::random_hex(6);
-  call.invite_uri = "sip:" + target + "@" + config_.domain;
+  call.invite_uri = "sip:" + target + "@" + sip_host(config_.domain);
   call.remote_uri = call.invite_uri;
   call.local_header = "<" + aor() + ">;tag=" + call.local_tag;
   call.remote_header = "<" + call.invite_uri + ">";

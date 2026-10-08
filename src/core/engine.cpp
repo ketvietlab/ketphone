@@ -77,10 +77,15 @@ class Engine final : public UserAgentHost {
       return nullptr;
     }
     const uint16_t port = config.server_port != 0 ? config.server_port : 5060;
-    const auto server = net::resolve(config.server_host, port);
-    if (!server) return nullptr;
-    auto sip = net::UdpSocket::open();
-    if (!sip || !sip->connect(*server)) return nullptr;
+    std::optional<net::UdpSocket> sip;
+    for (const auto& server : net::resolve_all(config.server_host, port)) {
+      auto candidate = net::UdpSocket::open(server.family);
+      if (candidate && candidate->connect(server)) {
+        sip = std::move(candidate);
+        break;
+      }
+    }
+    if (!sip) return nullptr;
     const auto local = sip->local();
     if (!local) return nullptr;
 
@@ -191,7 +196,7 @@ class Engine final : public UserAgentHost {
   }
 
   uint16_t open_media() override {
-    rtp_ = net::UdpSocket::open();
+    rtp_ = net::UdpSocket::open(sip_.family());
     if (!rtp_) return 0;
     const auto local = rtp_->local();
     if (!local) {
@@ -202,8 +207,19 @@ class Engine final : public UserAgentHost {
   }
 
   void start_media(const RemoteMedia& remote) override {
-    const auto endpoint = net::resolve(remote.address, remote.port);
-    if (!endpoint || !rtp_) return;
+    if (!rtp_) return;
+    const auto endpoints = net::resolve_all(remote.address, remote.port);
+    auto endpoint = std::find_if(endpoints.begin(), endpoints.end(), [this](const auto& item) {
+      return item.family == rtp_->family();
+    });
+    // A dual-stack IPv6 media socket can also reach an IPv4 media peer. On an IPv6-only
+    // Apple network the system resolver supplies a synthesized IPv6 endpoint instead.
+    if (endpoint == endpoints.end() && rtp_->family() == AF_INET6) {
+      endpoint = std::find_if(endpoints.begin(), endpoints.end(), [](const auto& item) {
+        return item.family == AF_INET;
+      });
+    }
+    if (endpoint == endpoints.end()) return;
     rtp_remote_ = *endpoint;
     if (media_.active()) return;  // a re-INVITE only moves the far end
     media_.start(sip::random_u32(), static_cast<uint16_t>(sip::random_u32()), sip::random_u32());

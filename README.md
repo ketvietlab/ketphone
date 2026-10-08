@@ -11,6 +11,7 @@ The core speaks only standard SIP/RTP and knows nothing about any particular bac
 - REGISTER uses MD5 digest with `qop=auth` and refreshes at half the granted lifetime.
 - INVITE/ACK/BYE/CANCEL/OPTIONS for both outgoing and incoming calls, with the RFC 3261 retransmission timers.
 - Single-stream audio SDP: PCMA (payload type 8) and telephone-event 101, ptime 20 ms.
+- IPv4 and IPv6 UDP signaling/media; IPv6 literals in SIP URIs and Via use brackets, while SDP uses `IN IP6`.
 - Symmetric RTP. Receive statistics follow RFC 3550 (loss, jitter); an adaptive jitter buffer (see below) with simple loss concealment.
 - The realtime audio thread touches only two lock-free ring buffers: no allocation, no locks, no logging.
 
@@ -40,6 +41,14 @@ scripts/check
 ```
 
 `scripts/check` is the local acceptance gate. It builds Debug with `-Werror`, AddressSanitizer and UndefinedBehaviorSanitizer and runs the tests, then builds Release and runs them again. There is no hosted CI yet. On macOS it also runs the Swift package tests.
+
+### IPv6 and DNS64/NAT64 acceptance
+
+Pass a DNS hostname in `server_host` whenever possible. The resolver uses `AF_UNSPEC` and preserves the system's address order; the engine tries the returned addresses until it can open and connect a socket. On Apple platforms it uses `AI_DEFAULT`, including the system's IPv6 synthesis for IPv4 literals received in SDP. The core does not assume a NAT64 prefix. A UDP `connect` only selects a route, so this does not provide failover when a selected server silently drops packets.
+
+SIP and RTP sockets support IPv4 and IPv6. The media socket follows the signaling socket's family and can send to an IPv4 media peer when signaling uses IPv6 on a dual-stack network. The loopback tests cover IPv6 REGISTER/unregister, outgoing and incoming calls, and non-silent PCMA audio in both directions. These tests do not exercise DNS64, a real NAT64 translator, APNs, CallKit or a production PBX.
+
+Before an App Store submission, test a signed app on an iPhone connected to IPv6-only Wi-Fi with cellular data disabled, against the pilot's IPv4 PBX through DNS64/NAT64. Check sign-in/provisioning, REGISTER, outgoing/incoming calls, background wake-up, actual SDP, two-way audio and hangup. An IPv4 PBX cannot route directly to the client's native IPv6 address advertised in SDP; the deployment needs a working media return path, such as PBX symmetric RTP learned from the translated incoming packets. Confirm this with packet evidence instead of assuming that IPv6 signaling proves audio works. Also retain IPv4 and native IPv6 regression checks. See [Apple's IPv6 requirement](https://developer.apple.com/support/ipv6/) and [system address synthesis guidance](https://developer.apple.com/library/archive/documentation/NetworkingInternetWeb/Conceptual/NetworkingOverview/UnderstandingandPreparingfortheIPv6Transition/UnderstandingandPreparingfortheIPv6Transition.html).
 
 ## Using it from Swift (iOS and macOS)
 
