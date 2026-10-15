@@ -13,8 +13,9 @@
  *   - All other functions may be called from any thread. They run on the network thread and wait
  *     for it (briefly: no network round trip), so their result is final when they return.
  *
- * Scope of this version: one account per engine, one call at a time, UDP only, G.711 A-law at
- * 8 kHz, all SIP traffic sent to the configured server (Asterisk acts as a B2BUA).
+ * Scope of this version: one account per engine, one call at a time, G.711 A-law at 8 kHz, all SIP
+ * traffic sent to the configured server (Asterisk acts as a B2BUA). Signalling runs over UDP, or
+ * over TLS with the media encrypted as SRTP (see ketphone_transport).
  */
 #ifndef KETPHONE_KETPHONE_H
 #define KETPHONE_KETPHONE_H
@@ -26,7 +27,7 @@
 extern "C" {
 #endif
 
-#define KETPHONE_API_VERSION 1
+#define KETPHONE_API_VERSION 2
 
 /* Audio frames crossing the API are signed 16-bit mono PCM at this rate. */
 #define KETPHONE_SAMPLE_RATE 8000
@@ -72,7 +73,7 @@ typedef enum ketphone_end_reason {
   KETPHONE_END_REJECTED = 4,
   /* No response from the server in time (status_code 408). */
   KETPHONE_END_TIMEOUT = 5,
-  /* Media could not be set up (no usable codec or no socket). */
+  /* Media could not be set up: no usable codec, no socket, or over TLS no SRTP key from the far end. */
   KETPHONE_END_MEDIA_FAILED = 6,
   /* The engine is shutting down. */
   KETPHONE_END_SHUTDOWN = 7
@@ -94,13 +95,23 @@ typedef struct ketphone_event {
 
 typedef void (*ketphone_event_callback)(const ketphone_event *event, void *context);
 
+typedef enum ketphone_transport {
+  /* SIP over UDP and media over plain RTP: nothing is encrypted. For trusted networks and tests. */
+  KETPHONE_TRANSPORT_UDP = 0,
+  /* SIP over TLS 1.2 or later, and media over SRTP (AES_CM_128_HMAC_SHA1_80) keyed through SDES
+   * crypto lines inside the encrypted signalling. A call whose far end offers or answers without a
+   * usable key is refused (status_code 488). The connection is kept up with keep-alives and opened
+   * again after it drops, with a new registration. */
+  KETPHONE_TRANSPORT_TLS = 1
+} ketphone_transport;
+
 typedef struct ketphone_config {
   /* Set to sizeof(ketphone_config); lets later versions add fields without breaking callers. */
   uint32_t struct_size;
   /* Host name or unbracketed IPv4/IPv6 address of the SIP server. Also used as the SIP domain.
    * Prefer a DNS name so the system resolver can use DNS64/NAT64 on IPv6-only networks. */
   const char *server_host;
-  /* 0 means 5060. */
+  /* 0 means 5060, or 5061 with KETPHONE_TRANSPORT_TLS. */
   uint16_t server_port;
   const char *extension;
   const char *password;
@@ -114,6 +125,18 @@ typedef struct ketphone_config {
   /* Header on incoming INVITEs that correlates the call with a push notification, e.g.
    * "X-KV-Call-Id" for the Két Việt server. NULL or "" disables it. */
   const char *correlation_header;
+
+  /* Fields below were added in API version 2. A caller built against version 1 passes the smaller
+   * struct_size, and they read as zero. */
+
+  /* KETPHONE_TRANSPORT_UDP (0) unless set. */
+  ketphone_transport transport;
+  /* TLS only. PEM certificates, one or more, that the server's certificate chain must end in; then
+   * only these are trusted. NULL or "" uses the system's trust store. */
+  const char *tls_trust_anchors;
+  /* TLS only. Name the server certificate must be issued for, also sent as SNI. NULL or "" means
+   * server_host. */
+  const char *tls_server_name;
 } ketphone_config;
 
 typedef struct ketphone_media_stats {
@@ -139,7 +162,9 @@ typedef struct ketphone_media_stats {
 const char *ketphone_version(void);
 
 /* Creates an engine and starts its network thread. Does not register; call ketphone_register.
- * Returns NULL when the configuration is invalid or the server cannot be resolved. */
+ * Returns NULL when the configuration is invalid, the server cannot be resolved, or TLS is asked for
+ * but not built in or its trust anchors do not parse. With TLS the connection is made in the
+ * background; until it is up, requests wait for it. */
 ketphone_engine *ketphone_engine_create(const ketphone_config *config,
                                         ketphone_event_callback callback, void *context);
 

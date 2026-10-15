@@ -5,10 +5,23 @@ import CKetPhoneAppleAudio
 /// Identifies a call for the lifetime of an engine. Never reused.
 public typealias CallID = Int32
 
+/// How signalling and media travel.
+public enum Transport: Sendable, Equatable {
+  /// SIP over UDP, plain RTP. For a network the server trusts.
+  case udp
+  /// SIP over TLS 1.2 or later, SRTP media keyed through the SDP; a call whose far end sends no
+  /// key fails. `trustAnchorsPEM` holds the certificates the server's chain must end in, and then
+  /// the only ones trusted; nil uses the system's trust store. `serverName` is the name the
+  /// certificate must be issued for; nil means the server host.
+  case tls(trustAnchorsPEM: String? = nil, serverName: String? = nil)
+}
+
 public struct Configuration: Sendable, Equatable {
   /// Host name or IPv4 address of the SIP server, also used as the SIP domain.
   public var serverHost: String
+  /// 0 means the transport's standard port: 5060 for UDP, 5061 for TLS.
   public var serverPort: UInt16
+  public var transport: Transport
   public var `extension`: String
   public var password: String
   /// Seconds to ask for in REGISTER; nil means the core's default of 300.
@@ -22,7 +35,8 @@ public struct Configuration: Sendable, Equatable {
 
   public init(
     serverHost: String,
-    serverPort: UInt16 = 5060,
+    serverPort: UInt16 = 0,
+    transport: Transport = .udp,
     extension: String,
     password: String,
     registerExpires: UInt32? = nil,
@@ -32,6 +46,7 @@ public struct Configuration: Sendable, Equatable {
   ) {
     self.serverHost = serverHost
     self.serverPort = serverPort
+    self.transport = transport
     self.extension = `extension`
     self.password = password
     self.registerExpires = registerExpires
@@ -260,21 +275,37 @@ extension Configuration {
         password.withCString { password in
           withOptionalCString(userAgent) { userAgent in
             withOptionalCString(correlationHeader) { header in
-              var config = ketphone_config()
-              config.struct_size = UInt32(MemoryLayout<ketphone_config>.size)
-              config.server_host = host
-              config.server_port = serverPort
-              config.extension = ext
-              config.password = password
-              config.register_expires = registerExpires ?? 0
-              config.jitter_buffer_ms = initialJitterBufferMilliseconds ?? 0
-              config.user_agent = userAgent
-              config.correlation_header = header
-              return body(config)
+              withOptionalCString(tlsSettings.anchors) { anchors in
+                withOptionalCString(tlsSettings.name) { name in
+                  var config = ketphone_config()
+                  config.struct_size = UInt32(MemoryLayout<ketphone_config>.size)
+                  config.server_host = host
+                  config.server_port = serverPort
+                  config.extension = ext
+                  config.password = password
+                  config.register_expires = registerExpires ?? 0
+                  config.jitter_buffer_ms = initialJitterBufferMilliseconds ?? 0
+                  config.user_agent = userAgent
+                  config.correlation_header = header
+                  config.transport = tlsSettings.enabled ? KETPHONE_TRANSPORT_TLS : KETPHONE_TRANSPORT_UDP
+                  config.tls_trust_anchors = anchors
+                  config.tls_server_name = name
+                  return body(config)
+                }
+              }
             }
           }
         }
       }
+    }
+  }
+}
+
+extension Configuration {
+  fileprivate var tlsSettings: (enabled: Bool, anchors: String?, name: String?) {
+    switch transport {
+    case .udp: return (false, nil, nil)
+    case .tls(let anchors, let name): return (true, anchors, name)
     }
   }
 }

@@ -4,6 +4,7 @@
 
 #include "sip/digest.hpp"
 #include "sip/random.hpp"
+#include "sip/sdp.hpp"
 #include "sip/text.hpp"
 
 namespace ketphone::core {
@@ -22,6 +23,9 @@ constexpr Duration kRegisterRetry = 30s;
 constexpr Duration kMinimumRefresh = 5s;
 
 constexpr const char* kAllow = "INVITE, ACK, CANCEL, BYE, OPTIONS";
+
+// The tag of the one crypto line this side offers; an answer must accept it by the same tag.
+constexpr uint32_t kOfferTag = 1;
 
 std::string tagged(const std::string& header, const std::string& tag) {
   if (sip::param_of(header, "tag")) return header;
@@ -54,14 +58,59 @@ UserAgent::UserAgent(UserAgentConfig config, UserAgentHost& host) : config_(std:
 
 std::string UserAgent::aor() const { return "sip:" + config_.extension + "@" + sip_host(config_.domain); }
 
+std::string UserAgent::sent_by() const {
+  std::string out = sip_host(config_.local_address);
+  if (config_.local_port != 0) out += ":" + std::to_string(config_.local_port);
+  return out;
+}
+
 std::string UserAgent::contact() const {
-  return "<sip:" + config_.extension + "@" + sip_host(config_.local_address) + ":" + std::to_string(config_.local_port) +
-         ";transport=udp>";
+  return "<sip:" + config_.extension + "@" + sent_by() + ";transport=" + sip::lowercase(config_.transport) + ">";
 }
 
 std::string UserAgent::via(const std::string& branch) const {
-  return "SIP/2.0/UDP " + sip_host(config_.local_address) + ":" + std::to_string(config_.local_port) + ";branch=" + branch +
-         ";rport";
+  return "SIP/2.0/" + config_.transport + " " + sent_by() + ";branch=" + branch + ";rport";
+}
+
+bool UserAgent::acceptable(const sip::AudioDescription& media, const sip::SdesCrypto** key) const {
+  if (!media.offers_pcma()) return false;
+  // Plain RTP cannot follow an RTP/SAVP stream; keys under RTP/AVP are simply not used.
+  if (!config_.srtp) return !media.savp;
+  if (media.crypto.empty()) return false;
+  if (key != nullptr) *key = &media.crypto.front();
+  return true;
+}
+
+std::string UserAgent::local_sdp_for(Call& call, const sip::AudioDescription* answering) const {
+  std::optional<sip::LocalCrypto> crypto;
+  if (config_.srtp) {
+    sip::LocalCrypto local;
+    local.key = call.srtp_key;
+    local.tag = kOfferTag;
+    const sip::SdesCrypto* chosen = nullptr;
+    if (answering != nullptr && acceptable(*answering, &chosen)) {
+      // An answer keeps the offer's profile and accepts the chosen line by its tag.
+      local.tag = chosen->tag;
+      local.savp = answering->savp;
+    }
+    crypto = local;
+  }
+  return sip::build_audio_sdp(config_.local_address, call.media_port, call.sdp_session, call.sdp_version++, crypto);
+}
+
+RemoteMedia UserAgent::remote_media_for(const Call& call, const sip::AudioDescription& media,
+                                        const sip::SdesCrypto* key) const {
+  RemoteMedia remote;
+  remote.address = media.address;
+  remote.port = media.port;
+  if (config_.srtp && key != nullptr) remote.srtp = MediaKeys{call.srtp_key, key->key};
+  return remote;
+}
+
+bool UserAgent::new_srtp_key(Call& call) const {
+  if (!config_.srtp) return true;
+  call.srtp_key.assign(sip::kSdesKeyLength, 0);
+  return sip::secure_random(call.srtp_key);
 }
 
 std::vector<Event> UserAgent::take_events() {
@@ -95,6 +144,7 @@ std::string UserAgent::send_request(const Request& request, TimePoint now, Final
   Transaction transaction;
   transaction.method = request.method;
   transaction.bytes = build_request(request, branch);
+  transaction.retransmitting = !reliable();
   transaction.interval = kT1;
   transaction.retransmit_at = now + kT1;
   transaction.deadline = now + kTransactionTimeout;
@@ -238,12 +288,14 @@ CommandResult UserAgent::call(int32_t call_id, const std::string& target, TimePo
   call.remote_header = "<" + call.invite_uri + ">";
   call.local_cseq = 1;
   call.media_open = port != 0;
+  call.media_port = port;
+  call.sdp_session = sip::random_u32();
   call_ = std::move(call);
-  if (port == 0) {
+  if (port == 0 || !new_srtp_key(*call_)) {
     end_call(EndReason::MediaFailed, 0);
     return CommandResult::Ok;
   }
-  call_->local_sdp = sip::build_audio_sdp(config_.local_address, port, sip::random_u32(), 1);
+  call_->local_sdp = local_sdp_for(*call_, nullptr);
   send_invite({}, now);
   return CommandResult::Ok;
 }
@@ -354,12 +406,20 @@ void UserAgent::on_invite_final(const InviteContext& context, const sip::Message
       return;
     }
     const auto answer = sip::parse_audio(response->body);
-    if (!answer || !answer->offers_pcma()) {
+    const sip::SdesCrypto* key = nullptr;
+    bool usable = answer && acceptable(*answer, &key);
+    if (usable && config_.srtp) {
+      // The answer must take up the key this side offered, by its tag (RFC 4568 section 5.1.3).
+      const auto accepted = std::find_if(answer->crypto.begin(), answer->crypto.end(),
+                                         [](const sip::SdesCrypto& crypto) { return crypto.tag == kOfferTag; });
+      key = accepted == answer->crypto.end() ? nullptr : &*accepted;
+      usable = key != nullptr;
+    }
+    if (!usable || !host_.start_media(remote_media_for(call, *answer, key))) {
       send_bye(now);
       end_call(EndReason::MediaFailed, 488);
       return;
     }
-    host_.start_media({answer->address, answer->port});
     Event event;
     event.kind = EventKind::CallAnswered;
     event.call_id = call.id;
@@ -425,13 +485,21 @@ void UserAgent::on_invite_request(const sip::Message& request, TimePoint now) {
       if (!call_->last_response.empty()) send_raw(call_->last_response);
       return;
     }
-    // A re-INVITE inside the dialog, e.g. the server moving media. Follow it if it is usable.
+    // A re-INVITE inside the dialog, e.g. the server moving media or changing keys. Follow it if
+    // it is usable.
     const auto offer = sip::parse_audio(request.body);
-    if (request.body.empty() || !offer || !offer->offers_pcma()) {
+    const sip::SdesCrypto* key = nullptr;
+    if (request.body.empty() || !offer || !acceptable(*offer, &key)) {
       send_raw(build_response(request, 488, {}));
       return;
     }
-    host_.start_media({offer->address, offer->port});
+    // With SRTP the answer names the crypto line it takes, so it is rebuilt; this side's key stays.
+    std::string answer = config_.srtp ? local_sdp_for(*call_, &*offer) : call_->local_sdp;
+    if (!host_.start_media(remote_media_for(*call_, *offer, key))) {
+      send_raw(build_response(request, 488, {}));
+      return;
+    }
+    call_->local_sdp = std::move(answer);
     send_raw(build_response(request, 200, {}, call_->local_sdp));
     return;
   }
@@ -442,7 +510,7 @@ void UserAgent::on_invite_request(const sip::Message& request, TimePoint now) {
     return;
   }
   const auto offer = sip::parse_audio(request.body);
-  if (!offer || !offer->offers_pcma()) {
+  if (!offer || !acceptable(*offer, nullptr)) {
     send_raw(build_response(request, 488, tag));
     return;
   }
@@ -486,21 +554,25 @@ CommandResult UserAgent::answer(int32_t call_id, TimePoint now) {
   Call& call = *call_;
   if (call.outgoing || call.state != CallState::Ringing) return CommandResult::State;
   const uint16_t port = host_.open_media();
-  if (port == 0) {
+  call.media_open = port != 0;
+  call.media_port = port;
+  call.sdp_session = sip::random_u32();
+  const sip::SdesCrypto* key = nullptr;
+  acceptable(call.offer, &key);
+  // Media starts before the 200 goes out so the first words are not clipped while the ACK is on
+  // its way, and so that keys the media layer refuses never reach the far end.
+  if (port == 0 || !new_srtp_key(call) || !host_.start_media(remote_media_for(call, call.offer, key))) {
     send_raw(build_response(*call.invite, 500, call.local_tag));
     end_call(EndReason::MediaFailed, 500);
     return CommandResult::Ok;
   }
-  call.media_open = true;
-  call.local_sdp = sip::build_audio_sdp(config_.local_address, port, sip::random_u32(), 1);
+  call.local_sdp = local_sdp_for(call, &call.offer);
   call.last_response = build_response(*call.invite, 200, call.local_tag, call.local_sdp);
   call.state = CallState::Answering;
   call.resend_interval = kT1;
   call.resend_at = now + kT1;
   call.ack_deadline = now + kTransactionTimeout;
   send_raw(call.last_response);
-  // Start sending right away so the first words are not clipped while the ACK is on its way.
-  host_.start_media({call.offer.address, call.offer.port});
   return CommandResult::Ok;
 }
 
@@ -558,6 +630,29 @@ void UserAgent::shutdown(TimePoint now) {
   shutting_down_ = true;
   if (call_) hangup(call_->id, now);
   stop_registration(now);
+}
+
+void UserAgent::on_transport_down(TimePoint now) {
+  // Whatever was sent on the old connection will not be answered there.
+  auto pending = std::move(transactions_);
+  transactions_.clear();
+  for (auto& [key, transaction] : pending) {
+    if (transaction.on_final) transaction.on_final(nullptr, now);
+  }
+  if (registration_.registered) {
+    // The server sends to the contact over the connection it came on, which is gone.
+    registration_.registered = false;
+    Event event;
+    event.kind = EventKind::Registration;
+    event.status = 503;
+    emit(std::move(event));
+  }
+}
+
+void UserAgent::on_transport_up(TimePoint now) {
+  if (shutting_down_ || !registration_.wanted || registration_.in_flight) return;
+  registration_.next_attempt.reset();
+  send_register(config_.register_expires, {}, now);
 }
 
 // Dispatch -------------------------------------------------------------------------------------

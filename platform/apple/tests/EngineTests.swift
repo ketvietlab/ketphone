@@ -11,6 +11,15 @@ import Testing
     }
   }
 
+  @Test func rejectsTrustAnchorsThatAreNotCertificates() {
+    #expect(throws: KetPhoneError.invalidConfiguration) {
+      _ = try Engine(
+        configuration: Configuration(
+          serverHost: "127.0.0.1", transport: .tls(trustAnchorsPEM: "not a certificate"), extension: "1001",
+          password: "x"))
+    }
+  }
+
   @Test func reportsTheVersion() {
     #expect(!Engine.version.isEmpty)
   }

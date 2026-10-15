@@ -1,11 +1,14 @@
 // The C API: an engine owns the sockets and one network thread that drives the user agent and
-// the media session. Commands from other threads run on that thread and are waited for.
+// the media session. Commands from other threads run on that thread and are waited for. Over TLS the
+// connection runs on its own thread or queue and hands what it receives to the network thread.
 #include <fcntl.h>
 #include <poll.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <array>
+#include <cstddef>
+#include <cstring>
 #include <atomic>
 #include <condition_variable>
 #include <deque>
@@ -14,14 +17,18 @@
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 #include "core/user_agent.hpp"
 #include "ketphone/ketphone.h"
 #include "media/media_session.hpp"
 #include "media/spsc_ring.hpp"
+#include "media/srtp.hpp"
+#include "net/tls_transport.hpp"
 #include "net/udp_socket.hpp"
 #include "sip/random.hpp"
+#include "sip/stream_framer.hpp"
 
 namespace ketphone::core {
 namespace {
@@ -32,6 +39,13 @@ constexpr Duration kFrame = 20ms;
 constexpr Duration kShutdownGrace = 2s;
 // 200 ms each way: enough for any audio callback size, small enough to bound added latency.
 constexpr size_t kRingSamples = 1600;
+// A double-CRLF ping (RFC 5626 section 3.5.1) keeps NAT bindings and the server's view of the
+// connection fresh.
+constexpr Duration kKeepAlive = 30s;
+constexpr Duration kReconnectFirst = 1s;
+constexpr Duration kReconnectMost = 30s;
+// What may wait for a connection; more than a burst of requests means something is stuck.
+constexpr size_t kPendingLimit = 65536;
 
 ketphone_result to_result(CommandResult result) {
   switch (result) {
@@ -76,7 +90,23 @@ class Engine final : public UserAgentHost {
         config.server_host[0] == '\0' || config.extension[0] == '\0') {
       return nullptr;
     }
-    const uint16_t port = config.server_port != 0 ? config.server_port : 5060;
+    // A C caller can put any number in the enum; reading it as one would be undefined in C++.
+    std::underlying_type_t<ketphone_transport> transport = 0;
+    std::memcpy(&transport, &config.transport, sizeof(transport));
+    if (transport != KETPHONE_TRANSPORT_UDP && transport != KETPHONE_TRANSPORT_TLS) return nullptr;
+    const bool tls = transport == KETPHONE_TRANSPORT_TLS;
+    net::TlsOptions tls_options;
+    if (tls) {
+      tls_options.host = config.server_host;
+      tls_options.port = config.server_port != 0 ? config.server_port : 5061;
+      tls_options.server_name = or_default(config.tls_server_name, {});
+      tls_options.trust_anchors_pem = or_default(config.tls_trust_anchors, {});
+      if (!net::tls_supported()) return nullptr;
+      if (!tls_options.trust_anchors_pem.empty() && !net::pem_certificates(tls_options.trust_anchors_pem)) return nullptr;
+    }
+    const uint16_t port = config.server_port != 0 ? config.server_port : (tls ? 5061 : 5060);
+    // Over UDP this is the signalling socket. Over TLS a UDP socket connected the same way only asks
+    // the system which local address faces the server, for SDP; nothing is sent on it.
     std::optional<net::UdpSocket> sip;
     for (const auto& server : net::resolve_all(config.server_host, port)) {
       auto candidate = net::UdpSocket::open(server.family);
@@ -88,26 +118,37 @@ class Engine final : public UserAgentHost {
     if (!sip) return nullptr;
     const auto local = sip->local();
     if (!local) return nullptr;
+    const int family = sip->family();
+    if (tls) sip.reset();
 
     UserAgentConfig ua;
     ua.domain = config.server_host;
     ua.extension = config.extension;
     ua.password = config.password;
     ua.local_address = local->address_string();
-    ua.local_port = local->port;
+    // Over TLS the server answers on the connection, so Via and Contact carry no port.
+    ua.local_port = tls ? 0 : local->port;
+    ua.transport = tls ? "TLS" : "UDP";
+    ua.srtp = tls;
     ua.register_expires = config.register_expires != 0 ? config.register_expires : 300;
     ua.user_agent = or_default(config.user_agent, std::string("KetPhone/") + KETPHONE_VERSION);
     ua.correlation_header = or_default(config.correlation_header, {});
 
     const uint32_t jitter_ms = config.jitter_buffer_ms != 0 ? config.jitter_buffer_ms : 60;
 
-    auto engine = std::unique_ptr<Engine>(new Engine(std::move(ua), std::move(*sip), int64_t{jitter_ms} * 1000, callback, context));
+    auto engine = std::unique_ptr<Engine>(
+        new Engine(std::move(ua), std::move(sip), family, int64_t{jitter_ms} * 1000, callback, context));
+    engine->tls_ = tls;
+    engine->tls_options_ = std::move(tls_options);
     if (!engine->start()) return nullptr;
     return engine;
   }
 
   ~Engine() override {
     stop();
+    // The connection may still call its listener until it is gone, and the listener wakes the pipe.
+    connection_.reset();
+    listener_.reset();
     if (wake_[0] >= 0) ::close(wake_[0]);
     if (wake_[1] >= 0) ::close(wake_[1]);
   }
@@ -192,11 +233,19 @@ class Engine final : public UserAgentHost {
   // UserAgentHost, on the network thread.
 
   void send_sip(const std::string& message) override {
-    sip_.send({reinterpret_cast<const uint8_t*>(message.data()), message.size()});
+    if (!tls_) {
+      sip_->send({reinterpret_cast<const uint8_t*>(message.data()), message.size()});
+      return;
+    }
+    if (connection_) {
+      connection_->send(message);  // queued by the connection until its handshake is done
+    } else if (pending_.size() + message.size() <= kPendingLimit) {
+      pending_ += message;  // goes out on the next connection
+    }
   }
 
   uint16_t open_media() override {
-    rtp_ = net::UdpSocket::open(sip_.family());
+    rtp_ = net::UdpSocket::open(media_family_);
     if (!rtp_) return 0;
     const auto local = rtp_->local();
     if (!local) {
@@ -206,8 +255,14 @@ class Engine final : public UserAgentHost {
     return local->port;
   }
 
-  void start_media(const RemoteMedia& remote) override {
-    if (!rtp_) return;
+  bool start_media(const RemoteMedia& remote) override {
+    if (!rtp_) return true;
+    if (remote.srtp) {
+      if (!use_keys(*remote.srtp)) return false;
+    } else {
+      srtp_out_.reset();
+      srtp_in_.reset();
+    }
     const auto endpoints = net::resolve_all(remote.address, remote.port);
     auto endpoint = std::find_if(endpoints.begin(), endpoints.end(), [this](const auto& item) {
       return item.family == rtp_->family();
@@ -219,23 +274,52 @@ class Engine final : public UserAgentHost {
         return item.family == AF_INET;
       });
     }
-    if (endpoint == endpoints.end()) return;
+    if (endpoint == endpoints.end()) return true;
     rtp_remote_ = *endpoint;
-    if (media_.active()) return;  // a re-INVITE only moves the far end
+    if (media_.active()) return true;  // a re-INVITE only moves the far end or changes its key
     media_.start(sip::random_u32(), static_cast<uint16_t>(sip::random_u32()), sip::random_u32());
     next_frame_ = Clock::now();
+    return true;
   }
 
   void close_media() override {
     if (media_.active()) publish_stats();
     media_.stop();
     rtp_.reset();
+    srtp_out_.reset();
+    srtp_in_.reset();
   }
 
  private:
-  Engine(UserAgentConfig config, net::UdpSocket sip, int64_t initial_delay_us, ketphone_event_callback callback,
-         void* context)
+  // Receives one connection's callbacks on its thread and queues them for the network thread. A
+  // generation number tells a replaced connection's late callbacks apart.
+  class LinkListener final : public net::StreamListener {
+   public:
+    LinkListener(Engine& engine, uint64_t generation) : engine_(engine), generation_(generation) {}
+    void on_connected() override { engine_.post({generation_, LinkEvent::Kind::Connected, {}}); }
+    void on_data(std::span<const uint8_t> data) override {
+      engine_.post({generation_, LinkEvent::Kind::Data, std::string(reinterpret_cast<const char*>(data.data()), data.size())});
+    }
+    void on_closed(net::StreamError) override { engine_.post({generation_, LinkEvent::Kind::Closed, {}}); }
+
+   private:
+    Engine& engine_;
+    uint64_t generation_;
+  };
+
+  struct LinkEvent {
+    enum class Kind { Connected, Data, Closed };
+    uint64_t generation = 0;
+    Kind kind = Kind::Closed;
+    std::string data;
+  };
+
+  enum class Link { Down, Connecting, Up };
+
+  Engine(UserAgentConfig config, std::optional<net::UdpSocket> sip, int media_family, int64_t initial_delay_us,
+         ketphone_event_callback callback, void* context)
       : sip_(std::move(sip)),
+        media_family_(media_family),
         capture_(kRingSamples),
         playout_(kRingSamples),
         media_(capture_, playout_, initial_delay_us),
@@ -283,11 +367,108 @@ class Engine final : public UserAgentHost {
     [[maybe_unused]] const auto written = ::write(wake_[1], &byte, 1);
   }
 
+  void post(LinkEvent event) {
+    {
+      std::lock_guard lock(inbox_mutex_);
+      inbox_.push_back(std::move(event));
+    }
+    wake();
+  }
+
+  // Keys for this call's SRTP. The outbound context is kept while this side's key stays the same,
+  // so its packet index carries on across a re-INVITE; the inbound one follows the far end's key.
+  bool use_keys(const MediaKeys& keys) {
+    if (keys.local.size() != media::kSrtpKeyLength || keys.remote.size() != media::kSrtpKeyLength) return false;
+    media::SrtpKey local{};
+    media::SrtpKey remote{};
+    std::copy(keys.local.begin(), keys.local.end(), local.begin());
+    std::copy(keys.remote.begin(), keys.remote.end(), remote.begin());
+    if (!srtp_out_ || srtp_out_->key() != local) {
+      auto stream = media::SrtpStream::create(media::SrtpStream::Direction::Outbound, local);
+      if (!stream) return false;
+      srtp_out_ = std::move(stream);
+    }
+    if (!srtp_in_ || srtp_in_->key() != remote) {
+      auto stream = media::SrtpStream::create(media::SrtpStream::Direction::Inbound, remote);
+      if (!stream) return false;
+      srtp_in_ = std::move(stream);
+    }
+    return true;
+  }
+
+  void connect_link(TimePoint now) {
+    connection_.reset();  // before its listener, which it may still be calling
+    ++generation_;
+    listener_ = std::make_unique<LinkListener>(*this, generation_);
+    framer_.reset();
+    connection_ = net::connect_tls(tls_options_, *listener_);
+    if (!connection_) {
+      schedule_reconnect(now);
+      return;
+    }
+    link_ = Link::Connecting;
+    if (!pending_.empty()) {
+      connection_->send(std::move(pending_));
+      pending_.clear();
+    }
+  }
+
+  void schedule_reconnect(TimePoint now) {
+    link_ = Link::Down;
+    reconnect_at_ = now + backoff_;
+    backoff_ = std::min<Duration>(backoff_ * 2, kReconnectMost);
+  }
+
+  void drop_link(TimePoint now) {
+    connection_.reset();
+    listener_.reset();
+    ++generation_;  // whatever the old connection still queued is ignored
+    framer_.reset();
+    schedule_reconnect(now);
+    ua_.on_transport_down(now);
+    deliver_events();
+  }
+
+  void drain_link() {
+    std::deque<LinkEvent> events;
+    {
+      std::lock_guard lock(inbox_mutex_);
+      events.swap(inbox_);
+    }
+    for (auto& event : events) {
+      if (event.generation != generation_) continue;
+      const TimePoint now = Clock::now();
+      switch (event.kind) {
+        case LinkEvent::Kind::Connected:
+          link_ = Link::Up;
+          backoff_ = kReconnectFirst;
+          keepalive_at_ = now + kKeepAlive;
+          ua_.on_transport_up(now);
+          deliver_events();
+          break;
+        case LinkEvent::Kind::Data:
+          framer_.push(event.data);
+          while (auto message = framer_.next()) {
+            ua_.on_message(*message, Clock::now());
+            deliver_events();
+          }
+          if (framer_.failed()) drop_link(now);
+          break;
+        case LinkEvent::Kind::Closed:
+          drop_link(now);
+          break;
+      }
+    }
+  }
+
   void deliver_events() {
     for (;;) {
       auto events = ua_.take_events();
       if (events.empty()) return;
       for (const auto& event : events) {
+        // A registration that got no answer over a connection that looks fine means the connection
+        // is dead without having noticed; open a new one.
+        if (tls_ && link_ == Link::Up && event.kind == EventKind::Registration && event.status == 408) relink_ = true;
         if (callback_ == nullptr) continue;
         ketphone_event out{};
         out.kind = static_cast<ketphone_event_kind>(event.kind);
@@ -320,19 +501,22 @@ class Engine final : public UserAgentHost {
   }
 
   void loop() {
-    std::array<uint8_t, 65536> buffer{};
+    // SRTP works in place and wants its buffers on a 4-byte boundary.
+    alignas(4) std::array<uint8_t, 65536> buffer{};
     for (;;) {
       TimePoint now = Clock::now();
       TimePoint wake_at = now + 200ms;
       if (const auto deadline = ua_.next_deadline()) wake_at = std::min(wake_at, *deadline);
       if (media_.active()) wake_at = std::min(wake_at, next_frame_);
       if (stopping_) wake_at = std::min(wake_at, stop_deadline_);
+      if (tls_ && link_ == Link::Down) wake_at = std::min(wake_at, reconnect_at_);
+      if (tls_ && link_ == Link::Up) wake_at = std::min(wake_at, keepalive_at_);
       const auto timeout = std::chrono::duration_cast<std::chrono::milliseconds>(wake_at - now).count();
 
       std::array<pollfd, 3> fds{};
       fds[0] = {wake_[0], POLLIN, 0};
-      fds[1] = {sip_.fd(), POLLIN, 0};
-      nfds_t count = 2;
+      nfds_t count = 1;
+      if (sip_) fds[count++] = {sip_->fd(), POLLIN, 0};
       if (rtp_) fds[count++] = {rtp_->fd(), POLLIN, 0};
       ::poll(fds.data(), count, static_cast<int>(std::max<long long>(0, timeout)));
 
@@ -340,8 +524,22 @@ class Engine final : public UserAgentHost {
       }
       run_commands();
 
-      for (;;) {
-        const auto size = sip_.receive(buffer);
+      if (tls_) {
+        drain_link();
+        now = Clock::now();
+        if (relink_) {
+          relink_ = false;
+          if (link_ == Link::Up) drop_link(now);
+        }
+        if (link_ == Link::Down && now >= reconnect_at_) connect_link(now);
+        if (link_ == Link::Up && now >= keepalive_at_) {
+          connection_->send("\r\n\r\n");
+          keepalive_at_ = now + kKeepAlive;
+        }
+      }
+
+      for (; sip_;) {
+        const auto size = sip_->receive(buffer);
         if (!size || *size == 0) break;  // an ICMP error on the connected socket also lands here
         ua_.on_message({reinterpret_cast<const char*>(buffer.data()), *size}, Clock::now());
         deliver_events();
@@ -350,7 +548,14 @@ class Engine final : public UserAgentHost {
       while (rtp_ && media_.active()) {
         const auto size = rtp_->receive(buffer);
         if (!size || *size == 0) break;
-        media_.on_packet({buffer.data(), *size}, micros(Clock::now()));
+        size_t length = *size;
+        if (srtp_in_) {
+          // Anything that does not authenticate is dropped: forged, replayed or not for this call.
+          const auto plain = srtp_in_->unprotect(buffer, length);
+          if (!plain) continue;
+          length = *plain;
+        }
+        media_.on_packet({buffer.data(), length}, micros(Clock::now()));
       }
 
       now = Clock::now();
@@ -361,8 +566,9 @@ class Engine final : public UserAgentHost {
         // Catch up after a stall, but never burst more than a few frames.
         if (now - next_frame_ > 10 * kFrame) next_frame_ = now;
         while (now >= next_frame_) {
-          std::array<uint8_t, media::kMaxPacketSize> packet{};
-          const size_t size = media_.next_packet(packet);
+          alignas(4) std::array<uint8_t, media::kMaxPacketSize + media::kSrtpTrailerRoom> packet{};
+          size_t size = media_.next_packet(std::span<uint8_t>(packet).first(media::kMaxPacketSize));
+          if (size > 0 && srtp_out_) size = srtp_out_->protect(packet, size);
           if (size > 0) rtp_->send_to({packet.data(), size}, rtp_remote_);
           media_.play_frame(micros(next_frame_));
           next_frame_ += kFrame;
@@ -382,9 +588,13 @@ class Engine final : public UserAgentHost {
     for (auto& command : abandoned) command(false);
   }
 
-  net::UdpSocket sip_;
+  // UDP signalling; empty over TLS.
+  std::optional<net::UdpSocket> sip_;
+  int media_family_;
   std::optional<net::UdpSocket> rtp_;
   net::Endpoint rtp_remote_;
+  std::unique_ptr<media::SrtpStream> srtp_out_;
+  std::unique_ptr<media::SrtpStream> srtp_in_;
   media::SpscRing<int16_t> capture_;
   media::SpscRing<int16_t> playout_;
   media::MediaSession media_;
@@ -406,6 +616,23 @@ class Engine final : public UserAgentHost {
 
   std::mutex stats_mutex_;
   media::MediaStats stats_;
+
+  // TLS signalling. Everything but the inbox belongs to the network thread. The listener is declared
+  // before the connection so that the connection, which calls it, is destroyed first.
+  bool tls_ = false;
+  net::TlsOptions tls_options_;
+  std::unique_ptr<LinkListener> listener_;
+  std::unique_ptr<net::TlsConnection> connection_;
+  uint64_t generation_ = 0;
+  Link link_ = Link::Down;
+  TimePoint reconnect_at_{};
+  Duration backoff_ = kReconnectFirst;
+  TimePoint keepalive_at_{};
+  bool relink_ = false;
+  std::string pending_;
+  sip::StreamFramer framer_;
+  std::mutex inbox_mutex_;
+  std::deque<LinkEvent> inbox_;
 };
 
 }  // namespace ketphone::core
@@ -420,9 +647,14 @@ const char* ketphone_version(void) { return KETPHONE_VERSION; }
 
 ketphone_engine* ketphone_engine_create(const ketphone_config* config, ketphone_event_callback callback,
                                         void* context) {
-  if (config == nullptr || config->struct_size < sizeof(ketphone_config)) return nullptr;
+  // Callers built against API version 1 pass a struct that ends before `transport`; the fields they
+  // do not know about read as zero.
+  if (config == nullptr || config->struct_size < offsetof(ketphone_config, transport)) return nullptr;
+  ketphone_config full{};
+  std::memcpy(&full, config, std::min<size_t>(config->struct_size, sizeof(full)));
+  full.struct_size = sizeof(full);
   try {
-    auto engine = ketphone::core::Engine::create(*config, callback, context);
+    auto engine = ketphone::core::Engine::create(full, callback, context);
     if (!engine) return nullptr;
     return new ketphone_engine{std::move(engine)};
   } catch (...) {
