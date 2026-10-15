@@ -56,7 +56,9 @@ class TlsSession {
 // Listens on 127.0.0.1 on a port of the system's choosing.
 class TlsServer {
  public:
-  explicit TlsServer(const TestPki& pki);
+  // `tls12_only` caps the server at TLS 1.2, as Asterisk runs: no session tickets follow the
+  // handshake, so the client hears nothing until it speaks first.
+  explicit TlsServer(const TestPki& pki, bool tls12_only = false);
   ~TlsServer();
   TlsServer(const TlsServer&) = delete;
   TlsServer& operator=(const TlsServer&) = delete;

@@ -117,10 +117,11 @@ TestPki::~TestPki() {
 
 const std::string& TestPki::ca_pem() const { return state_->ca_pem; }
 
-TlsServer::TlsServer(const TestPki& pki) {
+TlsServer::TlsServer(const TestPki& pki, bool tls12_only) {
   SSL_CTX* context = SSL_CTX_new(TLS_server_method());
   require(context != nullptr, "server context");
   SSL_CTX_set_min_proto_version(context, TLS1_2_VERSION);
+  if (tls12_only) SSL_CTX_set_max_proto_version(context, TLS1_2_VERSION);
   require(SSL_CTX_use_certificate(context, pki.state_->server) == 1 &&
               SSL_CTX_use_PrivateKey(context, pki.state_->server_key) == 1,
           "server certificate");

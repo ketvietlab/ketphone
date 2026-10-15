@@ -132,6 +132,22 @@ TEST(tls_connects_to_a_server_from_the_given_authority_and_carries_bytes_both_wa
   CHECK(by_address.connected);
 }
 
+TEST(tls_sends_what_was_queued_during_the_handshake_to_a_server_that_stays_quiet) {
+  // A TLS 1.2 server, like Asterisk, sends nothing after the handshake. Bytes queued while it ran
+  // must still go out without waiting for the server to speak.
+  TestPki pki({"localhost"});
+  TlsServer server(pki, true);
+  Listener listener;
+  auto connection = net::connect_tls(options_for(server, pki), listener);
+  CHECK(connection != nullptr);
+  connection->send("REGISTER queued before the handshake\r\n");
+  auto session = accept_while(server, listener);
+  CHECK(session != nullptr);
+  CHECK_EQ(session->receive_raw().value_or("nothing"), std::string("REGISTER queued before the handshake\r\n"));
+  connection->send("and one after");
+  CHECK_EQ(session->receive_raw().value_or("nothing"), std::string("and one after"));
+}
+
 TEST(tls_refuses_a_server_from_another_authority_or_for_another_name) {
   TestPki pki({"localhost"});
   TestPki stranger({"localhost"});

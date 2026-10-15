@@ -151,7 +151,10 @@ class OpenSslTls final : public TlsConnection {
     const bool address =
         ::inet_pton(AF_INET, name.c_str(), scratch.data()) == 1 || ::inet_pton(AF_INET6, name.c_str(), scratch.data()) == 1;
     if (address) return X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(ssl), name.c_str()) == 1;
-    return SSL_set_tlsext_host_name(ssl, name.c_str()) == 1 && SSL_set1_host(ssl, name.c_str()) == 1;
+    // SSL_set_tlsext_host_name, without the C cast in that macro which GCC reports even from a
+    // system header.
+    const long sni = SSL_ctrl(ssl, SSL_CTRL_SET_TLSEXT_HOSTNAME, TLSEXT_NAMETYPE_host_name, const_cast<char*>(name.c_str()));
+    return sni == 1 && SSL_set1_host(ssl, name.c_str()) == 1;
   }
 
   void run() {
@@ -208,17 +211,14 @@ class OpenSslTls final : public TlsConnection {
     }
   }
 
-  // Moves bytes both ways until the connection ends or the object is destroyed.
+  // Moves bytes both ways until the connection ends or the object is destroyed. Each round works
+  // before it waits: what was queued during the handshake has had its wake-up consumed there, and
+  // a TLS 1.2 server sends nothing that would wake the wait first.
   StreamError pump(SSL* ssl, int fd) {
     std::array<uint8_t, 16384> buffer{};
     std::string pending;
     bool want_write = false;
     for (;;) {
-      std::array<pollfd, 2> fds{{{fd, static_cast<short>(POLLIN | (want_write ? POLLOUT : 0)), 0}, {wake_[0], POLLIN, 0}}};
-      ::poll(fds.data(), fds.size(), -1);
-      drain_wake();
-      if (stopping_) return StreamError::Closed;
-
       // Read everything that is there, including what OpenSSL already buffered.
       for (;;) {
         const int size = SSL_read(ssl, buffer.data(), static_cast<int>(buffer.size()));
@@ -252,6 +252,12 @@ class OpenSslTls final : public TlsConnection {
         ERR_clear_error();
         return StreamError::Closed;
       }
+
+      // A send after the outbox was taken above has left a byte in the wake pipe, so this returns.
+      std::array<pollfd, 2> fds{{{fd, static_cast<short>(POLLIN | (want_write ? POLLOUT : 0)), 0}, {wake_[0], POLLIN, 0}}};
+      ::poll(fds.data(), fds.size(), -1);
+      drain_wake();
+      if (stopping_) return StreamError::Closed;
     }
   }
 
