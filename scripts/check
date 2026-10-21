@@ -41,9 +41,14 @@ if [[ "$(uname)" == "Darwin" ]] && [[ ${#openssl[@]} -gt 0 ]]; then
   ctest --test-dir "$with_openssl" --output-on-failure
 fi
 
-# The Swift package builds the same sources for Apple platforms, with its own tests.
+# The Swift package builds the same sources for Apple platforms, with its own tests. The iOS SDKs
+# lack headers macOS has (<sys/random.h>), so the package is also built for iPhone and its simulator.
 if [[ "$(uname)" == "Darwin" ]]; then
   swift test --package-path "$root"
+  for destination in "generic/platform=iOS" "generic/platform=iOS Simulator"; do
+    (cd "$root" && xcodebuild -quiet -scheme KetPhone -destination "$destination" \
+      -derivedDataPath "$root/build/ios" build)
+  done
 fi
 
 echo "check: ok"
