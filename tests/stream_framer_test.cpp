@@ -55,6 +55,12 @@ TEST(stream_framer_fails_without_content_length_or_when_too_large) {
   CHECK(!large.next().has_value());
   CHECK(large.failed());
 
+  // A length that wraps the size of the message around must not pass for a short one.
+  StreamFramer wrapping;
+  wrapping.push("MESSAGE sip:a SIP/2.0\r\nContent-Length: 18446744073709551615\r\n\r\n" + kOptions);
+  CHECK(!wrapping.next().has_value());
+  CHECK(wrapping.failed());
+
   StreamFramer endless;
   endless.push(std::string(StreamFramer::kMaxMessage + 1, 'x'));
   CHECK(!endless.next().has_value());

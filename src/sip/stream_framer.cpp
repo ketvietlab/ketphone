@@ -43,11 +43,12 @@ std::optional<std::string> StreamFramer::next() {
     return std::nullopt;
   }
   const auto length = content_length(std::string_view(buffer_).substr(0, head_end));
-  const size_t total = head_end + 4 + length.value_or(0);
-  if (!length || total > kMaxMessage) {
+  // Checked on its own first: a huge length would wrap the sum around to a small one.
+  if (!length || *length > kMaxMessage || head_end + 4 + *length > kMaxMessage) {
     failed_ = true;
     return std::nullopt;
   }
+  const size_t total = head_end + 4 + *length;
   if (buffer_.size() < total) return std::nullopt;
   std::string message = buffer_.substr(0, total);
   buffer_.erase(0, total);
