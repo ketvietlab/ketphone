@@ -6,18 +6,40 @@ set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
 build="$root/build/check"
 
+# The TLS tests play the server with OpenSSL. macOS ships none for building against, so use
+# Homebrew's when it is there; without it those tests are left out.
+openssl=()
+if [[ "$(uname)" == "Darwin" ]] && [[ -d /opt/homebrew/opt/openssl@3 ]]; then
+  openssl=(-DOPENSSL_ROOT_DIR=/opt/homebrew/opt/openssl@3)
+fi
+
 cmake -S "$root" -B "$build" -G Ninja \
   -DCMAKE_BUILD_TYPE=Debug \
   -DKETPHONE_WERROR=ON \
-  -DKETPHONE_SANITIZE=ON
+  -DKETPHONE_SANITIZE=ON \
+  ${openssl[@]+"${openssl[@]}"}
 cmake --build "$build"
 ctest --test-dir "$build" --output-on-failure
 
 # A release build catches warnings that only appear with optimisation.
 release="$root/build/release"
-cmake -S "$root" -B "$release" -G Ninja -DCMAKE_BUILD_TYPE=Release -DKETPHONE_WERROR=ON
+cmake -S "$root" -B "$release" -G Ninja -DCMAKE_BUILD_TYPE=Release -DKETPHONE_WERROR=ON \
+  ${openssl[@]+"${openssl[@]}"}
 cmake --build "$release"
 ctest --test-dir "$release" --output-on-failure
+
+# On macOS the builds above use Network.framework; the OpenSSL client, which Linux uses, gets its own.
+if [[ "$(uname)" == "Darwin" ]] && [[ ${#openssl[@]} -gt 0 ]]; then
+  with_openssl="$root/build/check-openssl"
+  cmake -S "$root" -B "$with_openssl" -G Ninja \
+    -DCMAKE_BUILD_TYPE=Debug \
+    -DKETPHONE_WERROR=ON \
+    -DKETPHONE_SANITIZE=ON \
+    -DKETPHONE_TLS=OPENSSL \
+    "${openssl[@]}"
+  cmake --build "$with_openssl"
+  ctest --test-dir "$with_openssl" --output-on-failure
+fi
 
 # The Swift package builds the same sources for Apple platforms, with its own tests.
 if [[ "$(uname)" == "Darwin" ]]; then

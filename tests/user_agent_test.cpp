@@ -1,5 +1,6 @@
 // The user agent against a scripted server: every datagram it sends is parsed and answered the
 // way the Asterisk configuration in ketviet's infra/telephony answers it.
+#include <algorithm>
 #include <chrono>
 #include <string>
 #include <vector>
@@ -8,6 +9,7 @@
 #include "core/user_agent.hpp"
 #include "sip/digest.hpp"
 #include "sip/message.hpp"
+#include "sip/sdp.hpp"
 
 using namespace ketphone;
 using namespace ketphone::core;
@@ -22,7 +24,10 @@ class FakeHost : public UserAgentHost {
     ++media_opened;
     return media_port;
   }
-  void start_media(const RemoteMedia& remote) override { media.push_back(remote); }
+  bool start_media(const RemoteMedia& remote) override {
+    media.push_back(remote);
+    return accept_media;
+  }
   void close_media() override { ++media_closed; }
 
   sip::Message last() const { return *sip::parse_message(sent.back()); }
@@ -31,6 +36,7 @@ class FakeHost : public UserAgentHost {
   std::vector<std::string> sent;
   std::vector<RemoteMedia> media;
   uint16_t media_port = 40000;
+  bool accept_media = true;
   int media_opened = 0;
   int media_closed = 0;
 };
@@ -444,4 +450,234 @@ TEST(shutdown_ends_the_call_and_unregisters) {
   CHECK(unregistered);
   CHECK(!ua.idle());
   CHECK(ua.call(4, "1002", t0()) == CommandResult::State);
+}
+
+// Over TLS, with SRTP -----------------------------------------------------------------------------
+
+namespace {
+
+UserAgentConfig secure_config() {
+  auto out = config();
+  out.transport = "TLS";
+  out.local_port = 0;
+  out.srtp = true;
+  return out;
+}
+
+std::vector<uint8_t> test_key(uint8_t seed) {
+  std::vector<uint8_t> key(sip::kSdesKeyLength);
+  for (size_t n = 0; n < key.size(); ++n) key[n] = static_cast<uint8_t>(seed + n);
+  return key;
+}
+
+// What Asterisk answers or offers with media_encryption=sdes: keys under RTP/AVP unless the other
+// side asked for RTP/SAVP.
+std::string secure_sdp(uint32_t tag, const std::vector<uint8_t>& key, bool savp = false, uint16_t port = 10002) {
+  return sip::build_audio_sdp("127.0.0.1", port, 1, 1, sip::LocalCrypto{savp, tag, key});
+}
+
+std::vector<uint8_t> offered_key(const sip::Message& message) {
+  const auto audio = sip::parse_audio(message.body);
+  CHECK(audio.has_value());
+  CHECK_EQ(audio->crypto.size(), size_t{1});
+  return audio->crypto[0].key;
+}
+
+}  // namespace
+
+TEST(tls_transport_names_tls_without_a_port_and_never_retransmits) {
+  FakeHost host;
+  UserAgent ua(secure_config(), host);
+  ua.start_registration(t0());
+  const auto registration = host.last();
+  CHECK(registration.header("via")->starts_with("SIP/2.0/TLS 192.168.1.20;branch=z9hG4bK"));
+  CHECK_EQ(std::string(*registration.header("contact")), std::string("<sip:1001@192.168.1.20;transport=tls>"));
+  ua.on_timer(t0() + 4s);
+  ua.on_timer(t0() + 20s);
+  CHECK_EQ(host.sent.size(), size_t{1});
+  // The transaction still times out: a connection can die without either side noticing.
+  ua.on_timer(t0() + 33s);
+  const auto registrations = events_of(ua, EventKind::Registration);
+  CHECK_EQ(registrations.size(), size_t{1});
+  CHECK_EQ(registrations[0].status, 408);
+}
+
+TEST(secure_outgoing_call_offers_its_key_and_uses_the_one_answered) {
+  FakeHost host;
+  UserAgent ua(secure_config(), host);
+  register_ok(ua, host);
+  CHECK(ua.call(7, "1002", t0()) == CommandResult::Ok);
+  const auto invite = host.last();
+  CHECK(invite.body.find("m=audio 40000 RTP/SAVP 8 101\r\n") != std::string::npos);
+  CHECK(invite.body.find("a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:") != std::string::npos);
+  const auto mine = offered_key(invite);
+  CHECK(mine != std::vector<uint8_t>(sip::kSdesKeyLength, 0));
+  // Every call gets a fresh key.
+  FakeHost other_host;
+  UserAgent other(secure_config(), other_host);
+  CHECK(other.call(8, "1002", t0()) == CommandResult::Ok);
+  CHECK(offered_key(other_host.last()) != mine);
+
+  const auto theirs = test_key(9);
+  ua.on_message(respond(invite, 200, "Contact: <sip:asterisk@127.0.0.1:5061;transport=tls>\r\n", "srv",
+                        secure_sdp(1, theirs, true)),
+                t0());
+  CHECK_EQ(host.last().method, std::string("ACK"));
+  CHECK_EQ(host.media.size(), size_t{1});
+  CHECK(host.media[0].srtp.has_value());
+  CHECK(host.media[0].srtp->local == mine);
+  CHECK(host.media[0].srtp->remote == theirs);
+  CHECK_EQ(events_of(ua, EventKind::CallAnswered).size(), size_t{1});
+}
+
+TEST(secure_call_answered_without_its_key_is_hung_up) {
+  const std::vector<std::string> answers = {
+      kAnswer,                         // plain RTP
+      secure_sdp(2, test_key(9), true),  // a key, but not for the line this side offered
+  };
+  for (const auto& body : answers) {
+    FakeHost host;
+    UserAgent ua(secure_config(), host);
+    CHECK(ua.call(7, "1002", t0()) == CommandResult::Ok);
+    const auto invite = host.last();
+    ua.on_message(respond(invite, 200, "Contact: <sip:asterisk@127.0.0.1:5061>\r\n", "srv", body), t0());
+    CHECK_EQ(host.at(host.sent.size() - 2).method, std::string("ACK"));
+    CHECK_EQ(host.last().method, std::string("BYE"));
+    CHECK(host.media.empty());
+    const auto ended = events_of(ua, EventKind::CallEnded);
+    CHECK_EQ(ended.size(), size_t{1});
+    CHECK(ended[0].end_reason == EndReason::MediaFailed);
+  }
+}
+
+TEST(secure_incoming_call_answers_under_the_offers_tag_and_profile) {
+  FakeHost host;
+  UserAgent ua(secure_config(), host);
+  const auto theirs = test_key(40);
+  ua.on_message(incoming_invite("sec-1", secure_sdp(5, theirs)), t0());
+  CHECK_EQ(host.last().status, 180);
+  const int32_t id = events_of(ua, EventKind::CallIncoming).at(0).call_id;
+  CHECK(ua.answer(id, t0()) == CommandResult::Ok);
+  const auto ok = host.last();
+  CHECK_EQ(ok.status, 200);
+  // Asterisk offered keys under RTP/AVP, so the answer stays on RTP/AVP and takes tag 5.
+  CHECK(ok.body.find("m=audio 40000 RTP/AVP 8 101\r\n") != std::string::npos);
+  CHECK(ok.body.find("a=crypto:5 AES_CM_128_HMAC_SHA1_80 inline:") != std::string::npos);
+  const auto mine = offered_key(ok);
+  CHECK_EQ(host.media.size(), size_t{1});
+  CHECK(host.media[0].srtp->remote == theirs);
+  CHECK(host.media[0].srtp->local == mine);
+  CHECK(mine != theirs);
+}
+
+TEST(secure_agent_refuses_plain_offers_and_plain_agent_refuses_savp) {
+  FakeHost secure_host;
+  UserAgent secure(secure_config(), secure_host);
+  secure.on_message(incoming_invite("sec-2"), t0());
+  CHECK_EQ(secure_host.last().status, 488);
+  CHECK(!secure.has_call());
+
+  FakeHost plain_host;
+  UserAgent plain(config(), plain_host);
+  plain.on_message(incoming_invite("sec-3", secure_sdp(1, test_key(1), true)), t0());
+  CHECK_EQ(plain_host.last().status, 488);
+  CHECK(!plain.has_call());
+  // Optimistic keys under RTP/AVP are fine for a plain agent: it answers without them.
+  plain.on_message(incoming_invite("sec-4", secure_sdp(1, test_key(1))), t0());
+  CHECK_EQ(plain_host.last().status, 180);
+  CHECK(plain.answer(events_of(plain, EventKind::CallIncoming).at(0).call_id, t0()) == CommandResult::Ok);
+  CHECK_EQ(plain_host.last().status, 200);
+  CHECK(plain_host.last().body.find("a=crypto") == std::string::npos);
+  CHECK(!plain_host.media.at(0).srtp.has_value());
+}
+
+TEST(media_refusing_the_keys_ends_the_call_before_any_answer) {
+  FakeHost host;
+  host.accept_media = false;
+  UserAgent ua(secure_config(), host);
+  ua.on_message(incoming_invite("sec-5", secure_sdp(1, test_key(3))), t0());
+  CHECK(ua.answer(events_of(ua, EventKind::CallIncoming).at(0).call_id, t0()) == CommandResult::Ok);
+  CHECK_EQ(host.last().status, 500);
+  CHECK(host.last().body.find("a=crypto") == std::string::npos);
+  auto ended = events_of(ua, EventKind::CallEnded);
+  CHECK_EQ(ended.size(), size_t{1});
+  CHECK(ended[0].end_reason == EndReason::MediaFailed);
+
+  FakeHost outgoing_host;
+  outgoing_host.accept_media = false;
+  UserAgent outgoing(secure_config(), outgoing_host);
+  CHECK(outgoing.call(7, "1002", t0()) == CommandResult::Ok);
+  outgoing.on_message(respond(outgoing_host.last(), 200, "Contact: <sip:a@127.0.0.1>\r\n", "srv",
+                              secure_sdp(1, test_key(3), true)),
+                      t0());
+  CHECK_EQ(outgoing_host.last().method, std::string("BYE"));
+  ended = events_of(outgoing, EventKind::CallEnded);
+  CHECK_EQ(ended.size(), size_t{1});
+  CHECK(ended[0].end_reason == EndReason::MediaFailed);
+}
+
+TEST(secure_reinvite_follows_new_keys_and_refuses_dropping_them) {
+  FakeHost host;
+  UserAgent ua(secure_config(), host);
+  ua.on_message(incoming_invite("sec-6", secure_sdp(1, test_key(10))), t0());
+  CHECK(ua.answer(events_of(ua, EventKind::CallIncoming).at(0).call_id, t0()) == CommandResult::Ok);
+  const auto ok = host.last();
+  const std::string tag = *sip::param_of(*ok.header("to"), "tag");
+  const auto mine = offered_key(ok);
+  ua.on_message(in_dialog("ACK", "sec-6", 102, tag), t0());
+
+  const auto reinvite = [&](const std::string& body, int cseq) {
+    std::string request = in_dialog("INVITE", "sec-6", cseq, tag);
+    request.replace(request.find("Content-Length: 0"), 17,
+                    "Content-Type: application/sdp\r\nContent-Length: " + std::to_string(body.size()));
+    return request + body;
+  };
+  ua.on_message(reinvite(secure_sdp(2, test_key(20), false, 10010), 103), t0());
+  const auto moved = host.last();
+  CHECK_EQ(moved.status, 200);
+  CHECK(moved.body.find("a=crypto:2 ") != std::string::npos);
+  CHECK(offered_key(moved) == mine);  // this side's key stays for the whole call
+  CHECK_EQ(host.media.size(), size_t{2});
+  CHECK_EQ(host.media[1].port, uint16_t{10010});
+  CHECK(host.media[1].srtp->remote == test_key(20));
+
+  ua.on_message(reinvite(kAnswer, 104), t0());
+  CHECK_EQ(host.last().status, 488);
+  CHECK_EQ(host.media.size(), size_t{2});
+  CHECK(ua.has_call());
+}
+
+TEST(lost_connection_fails_requests_and_drops_registration_until_it_is_back) {
+  FakeHost host;
+  UserAgent ua(secure_config(), host);
+  register_ok(ua, host);
+  CHECK(ua.call(7, "1002", t0()) == CommandResult::Ok);
+  ua.on_transport_down(t0() + 1s);
+  auto events = ua.take_events();
+  const auto registration = std::find_if(events.begin(), events.end(), [](const Event& e) {
+    return e.kind == EventKind::Registration;
+  });
+  CHECK(registration != events.end());
+  CHECK_EQ(registration->status, 503);
+  const auto ended = std::find_if(events.begin(), events.end(), [](const Event& e) {
+    return e.kind == EventKind::CallEnded;
+  });
+  CHECK(ended != events.end());
+  CHECK(!ua.has_call());
+
+  host.sent.clear();
+  ua.on_transport_up(t0() + 2s);
+  CHECK_EQ(host.sent.size(), size_t{1});
+  CHECK_EQ(host.last().method, std::string("REGISTER"));
+  CHECK_EQ(std::string(*host.last().header("expires")), std::string("120"));
+  // A second notice while that REGISTER is out sends nothing more.
+  ua.on_transport_up(t0() + 2s);
+  CHECK_EQ(host.sent.size(), size_t{1});
+
+  FakeHost idle_host;
+  UserAgent idle(secure_config(), idle_host);
+  idle.on_transport_up(t0());
+  CHECK(idle_host.sent.empty());  // nobody asked to register
+  idle.on_transport_down(t0());
+  CHECK(idle.take_events().empty());
 }

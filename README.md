@@ -6,7 +6,7 @@ The core speaks only standard SIP/RTP and knows nothing about any particular bac
 
 ## Scope of the proof of concept
 
-- One account per engine, one call at a time, UDP only.
+- One account per engine, one call at a time, over UDP or TLS (see below).
 - Every SIP message goes to the configured server. Asterisk acts as a B2BUA, so there is no Record-Route or DNS SRV handling.
 - REGISTER uses MD5 digest with `qop=auth` and refreshes at half the granted lifetime.
 - INVITE/ACK/BYE/CANCEL/OPTIONS for both outgoing and incoming calls, with the RFC 3261 retransmission timers.
@@ -15,32 +15,44 @@ The core speaks only standard SIP/RTP and knows nothing about any particular bac
 - Symmetric RTP. Receive statistics follow RFC 3550 (loss, jitter); an adaptive jitter buffer (see below) with simple loss concealment.
 - The realtime audio thread touches only two lock-free ring buffers: no allocation, no locks, no logging.
 
-Not in this version: SRTP, Opus, RTCP, outgoing DTMF, TCP/TLS, and ICE/STUN (internal calls run over Tailscale, so they are not needed yet). There is no echo cancellation in the core; on iOS the app uses VoiceProcessingIO.
+Not in this version: Opus, RTCP, outgoing DTMF, plain TCP, DTLS-SRTP and ICE/STUN. There is no echo cancellation in the core; on iOS the app uses VoiceProcessingIO.
+
+## SIP over TLS with SRTP
+
+`transport = KETPHONE_TRANSPORT_TLS` (Swift: `.tls(trustAnchorsPEM:serverName:)`) carries SIP over TLS 1.2 or later, port 5061 unless given, and always pairs it with SRTP. UDP stays available for a trusted network.
+
+- **TLS.** Network.framework on Apple platforms, so the system does the handshake and no TLS library ships inside the app; OpenSSL elsewhere (`-DKETPHONE_TLS=AUTO|APPLE|OPENSSL|OFF`). `tls_trust_anchors` makes the given PEM certificates the only ones trusted, which is how a private CA is pinned; without it the system trust store applies. The certificate must be for `tls_server_name`, or the server host when that is empty; an IP address is checked against the certificate's IP entries.
+- **Connection.** The engine connects as soon as it starts and keeps one connection. Messages are framed by Content-Length (RFC 3261 §18.3). Requests are not retransmitted on it, though their timeouts still run. A double CRLF goes out every 30 s (RFC 5626 §3.5.1). When the connection drops the registration is reported lost (503), pending requests fail, and the engine reconnects after 1 s, doubling up to 30 s, and registers again. A registration that times out on a connection that looks fine also makes it reconnect. An established call keeps its media, which does not use the connection.
+- **SRTP.** SDES (RFC 4568) with `AES_CM_128_HMAC_SHA1_80` only, through libsrtp. Each call gets a fresh key from the system's random source. Offers go out as `RTP/SAVP`; offers with keys under `RTP/AVP`, as Asterisk's optimistic SRTP sends them, are answered on the same profile. A far end that offers or answers no usable key gets 488, or a BYE with `KETPHONE_END_MEDIA_FAILED`. Packets that fail authentication or repeat are dropped. A UDP engine refuses `RTP/SAVP` offers and ignores optimistic keys.
+- **Compatibility.** `ketphone_config` gained `transport`, `tls_trust_anchors` and `tls_server_name` in API version 2. A caller built against version 1 passes a smaller `struct_size`, and those fields read as zero: UDP, as before.
+
+Apple's trust evaluation has rules for TLS server certificates even under a private CA: subjectAltName with the name (the common name is not checked), extended key usage `serverAuth`, a validity of at most 825 days, and a SHA-2 signature with an RSA key of at least 2048 bits or an ECDSA key. The tests build such a CA and certificate with OpenSSL at run time ([`tests/tls_server.cpp`](tests/tls_server.cpp)).
 
 ## Layout
 
 ```
 include/ketphone/ketphone.h   public C API (stable, C types only)
-src/sip/                      message parse/build, digest, MD5, SDP
-src/media/                    G.711, RTP, jitter buffer, SPSC ring, media session
-src/net/                      non-blocking UDP socket
+src/sip/                      message parse/build, digest, MD5, SDP and SDES, base64, stream framing
+src/media/                    G.711, RTP, SRTP, jitter buffer, SPSC ring, media session
+src/net/                      non-blocking UDP socket, TLS (Network.framework or OpenSSL), PEM
 src/core/user_agent.*         SIP state machine: no sockets, no clock, fully testable
 src/core/engine.cpp           network thread + C API
 tools/ketphone-poc/           measurement tool, uses only the C API
 platform/apple/               Swift package: Swift API, VoiceProcessingIO audio (C), tests
-tests/                        unit tests, network simulation, C API over loopback UDP
+tests/                        unit tests, network simulation, C API over loopback UDP and TLS
 scripts/                      local gate and network impairment runs
+third_party/libsrtp/          libsrtp 2.7.0, the subset this core builds (see its README)
 ```
 
 ## Build and check
 
-Requires CMake ≥ 3.24, Ninja and a C++20 compiler (Apple clang, or clang/gcc on Linux).
+Requires CMake ≥ 3.24, Ninja and a C++20 compiler (Apple clang, or clang/gcc on Linux). On Linux, TLS needs OpenSSL 1.1.1 or later (`libssl-dev`). The TLS tests play the server with OpenSSL on every platform; on macOS that means Homebrew's `openssl@3`, and without it they are left out.
 
 ```bash
 scripts/check
 ```
 
-`scripts/check` is the local acceptance gate. It builds Debug with `-Werror`, AddressSanitizer and UndefinedBehaviorSanitizer and runs the tests, then builds Release and runs them again. There is no hosted CI yet. On macOS it also runs the Swift package tests.
+`scripts/check` is the local acceptance gate. It builds Debug with `-Werror`, AddressSanitizer and UndefinedBehaviorSanitizer and runs the tests, then builds Release and runs them again. On macOS those builds use Network.framework, so it builds the OpenSSL client a third time, again with the sanitizers, and runs the Swift package tests. There is no hosted CI yet.
 
 ### IPv6 and DNS64/NAT64 acceptance
 
@@ -106,6 +118,13 @@ KETPHONE_PASSWORD='...' build/check/ketphone-poc --server 127.0.0.1 --user 1001 
 ```
 
 The password is read only from the environment so that it never shows up in the process list.
+
+Over TLS, add `--tls` with the CA that signed Asterisk's certificate and the name on it; the port defaults to 5061:
+
+```bash
+KETPHONE_PASSWORD='...' build/check/ketphone-poc --server 127.0.0.1 --tls --ca ca.pem --server-name localhost \
+  --user 1001 --call 1002
+```
 
 ### When Docker runs on Colima
 
@@ -187,4 +206,4 @@ Results on 24 September 2026 (20 second calls), first with the earlier fixed 60 
 
 KetPhone core is released under the [MIT licence](LICENSE).
 
-Any third-party library added to the core must be under BSD, MIT or Apache-2.0. GPL and LGPL are excluded because the core is linked statically into apps distributed through the App Store. The current version has no third-party dependencies: MD5, G.711, RTP and the test harness are all written here.
+Any third-party library added to the core must be under BSD, MIT or Apache-2.0. GPL and LGPL are excluded because the core is linked statically into apps distributed through the App Store. The one third-party library is libsrtp (BSD-3-Clause, [`third_party/libsrtp/LICENSE`](third_party/libsrtp/LICENSE)), compiled into the core; an app that ships the core must carry its notice. TLS comes from the platform (Network.framework) or from OpenSSL (Apache-2.0) linked by the build that uses it. MD5, G.711, RTP, base64 and the test harness are written here.

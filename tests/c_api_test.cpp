@@ -6,6 +6,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -158,4 +159,17 @@ TEST(c_api_registers_over_udp_and_unregisters_on_destroy) {
   const auto expires = server.expires_seen();
   CHECK_EQ(expires.size(), size_t{2});
   CHECK_EQ(expires.back(), std::string("0"));
+}
+
+TEST(c_api_reads_a_version_1_config_as_udp) {
+  // A caller built against API version 1 passes a shorter struct; what follows it is not read.
+  ketphone_config config = config_for(5060);
+  config.struct_size = offsetof(ketphone_config, transport);
+  config.transport = KETPHONE_TRANSPORT_TLS;
+  config.tls_trust_anchors = "not a certificate";
+  ketphone_engine* engine = ketphone_engine_create(&config, nullptr, nullptr);
+  CHECK(engine != nullptr);
+  ketphone_engine_destroy(engine);
+  config.struct_size = offsetof(ketphone_config, transport) - 1;
+  CHECK(ketphone_engine_create(&config, nullptr, nullptr) == nullptr);
 }

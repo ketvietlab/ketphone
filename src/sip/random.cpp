@@ -1,7 +1,14 @@
 #include "sip/random.hpp"
 
+#include <unistd.h>
+
+#include <algorithm>
 #include <mutex>
 #include <random>
+
+#if defined(__APPLE__)
+#include <sys/random.h>
+#endif
 
 namespace ketphone::sip {
 namespace {
@@ -31,6 +38,17 @@ std::string random_hex(size_t bytes) {
     out.push_back(kHex[byte & 0x0f]);
   }
   return out;
+}
+
+bool secure_random(std::span<uint8_t> out) {
+  // getentropy is available on Apple platforms, glibc 2.25+ and Android API 28+; it never returns
+  // short and accepts at most 256 bytes per call.
+  while (!out.empty()) {
+    const size_t chunk = std::min<size_t>(out.size(), 256);
+    if (::getentropy(out.data(), chunk) != 0) return false;
+    out = out.subspan(chunk);
+  }
+  return true;
 }
 
 }  // namespace ketphone::sip

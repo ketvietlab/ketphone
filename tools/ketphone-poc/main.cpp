@@ -19,8 +19,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <fstream>
 #include <mutex>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -44,7 +46,10 @@ constexpr int kQuietBeforeOnset = kRate / 5;
 
 struct Options {
   std::string server = "127.0.0.1";
-  uint16_t port = 5060;
+  uint16_t port = 0;  // the transport's standard port
+  bool tls = false;
+  std::string trust_anchors;  // PEM read from --ca
+  std::string server_name;
   std::string user;
   std::string call;
   bool answer = false;
@@ -113,7 +118,11 @@ double millis_since(Clock::time_point start) {
 void usage() {
   std::fprintf(stderr,
                "usage: KETPHONE_PASSWORD=... ketphone-poc --user EXT (--call TARGET | --answer)\n"
-               "         [--server HOST[:PORT]] [--seconds N] [--jitter-ms N] [--correlation-header NAME]\n");
+               "         [--server HOST[:PORT]] [--seconds N] [--jitter-ms N] [--correlation-header NAME]\n"
+               "         [--tls [--ca FILE.pem] [--server-name NAME]]\n"
+               "  --tls          SIP over TLS (port 5061 unless given) with SRTP media\n"
+               "  --ca           trust only the certificates in this PEM file (default: the system's)\n"
+               "  --server-name  name the server certificate must carry (default: the server host)\n");
 }
 
 std::optional<Options> parse_options(int argc, char** argv) {
@@ -126,6 +135,10 @@ std::optional<Options> parse_options(int argc, char** argv) {
     };
     if (arg == "--answer") {
       options.answer = true;
+      continue;
+    }
+    if (arg == "--tls") {
+      options.tls = true;
       continue;
     }
     const auto next = value();
@@ -144,11 +157,23 @@ std::optional<Options> parse_options(int argc, char** argv) {
       options.jitter_ms = static_cast<unsigned>(std::max(20, std::atoi(next->c_str())));
     } else if (arg == "--correlation-header") {
       options.correlation_header = *next;
+    } else if (arg == "--ca") {
+      std::ifstream file(*next);
+      std::ostringstream text;
+      text << file.rdbuf();
+      if (!file) {
+        std::fprintf(stderr, "cannot read %s\n", next->c_str());
+        return std::nullopt;
+      }
+      options.trust_anchors = text.str();
+    } else if (arg == "--server-name") {
+      options.server_name = *next;
     } else {
       return std::nullopt;
     }
   }
   if (options.user.empty() || options.call.empty() == !options.answer) return std::nullopt;
+  if (!options.tls && (!options.trust_anchors.empty() || !options.server_name.empty())) return std::nullopt;
   return options;
 }
 
@@ -379,9 +404,15 @@ int main(int argc, char** argv) {
   config.jitter_buffer_ms = options->jitter_ms;
   config.user_agent = "ketphone-poc";
   config.correlation_header = options->correlation_header.c_str();
+  if (options->tls) {
+    config.transport = KETPHONE_TRANSPORT_TLS;
+    if (!options->trust_anchors.empty()) config.tls_trust_anchors = options->trust_anchors.c_str();
+    if (!options->server_name.empty()) config.tls_server_name = options->server_name.c_str();
+  }
 
-  std::printf("ketphone %s server=%s:%u user=%s\n", ketphone_version(), options->server.c_str(), options->port,
-              options->user.c_str());
+  const unsigned port = options->port != 0 ? options->port : (options->tls ? 5061u : 5060u);
+  std::printf("ketphone %s server=%s:%u transport=%s user=%s\n", ketphone_version(), options->server.c_str(), port,
+              options->tls ? "tls" : "udp", options->user.c_str());
   ketphone_engine* engine = ketphone_engine_create(&config, on_event, &events);
   if (engine == nullptr) {
     std::printf("engine error=create-failed\n");
