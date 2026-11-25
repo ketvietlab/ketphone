@@ -341,15 +341,53 @@ void UserAgent::on_invite_provisional(int32_t call_id, const sip::Message& respo
     send_cancel(now);
     return;
   }
-  if ((response.status == 180 || response.status == 183) && call_->last_progress != response.status) {
-    call_->last_progress = response.status;
+  Call& call = *call_;
+  // A 183 with a usable answer is the far end's own media: a carrier's ringing tone, an
+  // announcement. It is played in place of the local ringing tone from then on.
+  if (response.status == 183) {
+    if (const auto media = media_of_answer(call, response); media && host_.start_media(*media)) {
+      call.early_media = true;
+      stop_ringback();
+    }
+  }
+  // 180 alone says the phone rings and carries no sound; the caller would hear nothing.
+  if (response.status == 180 && !call.early_media) start_ringback();
+  if ((response.status == 180 || response.status == 183) && call.last_progress != response.status) {
+    call.last_progress = response.status;
     Event event;
     event.kind = EventKind::CallProgress;
     event.call_id = call_id;
     event.status = response.status;
-    event.remote = call_->remote_uri;
+    event.remote = call.remote_uri;
     emit(std::move(event));
   }
+}
+
+std::optional<RemoteMedia> UserAgent::media_of_answer(const Call& call, const sip::Message& response) const {
+  if (response.body.empty()) return std::nullopt;
+  const auto answer = sip::parse_audio(response.body);
+  const sip::SdesCrypto* key = nullptr;
+  if (!answer || !answer->remote_sends || !acceptable(*answer, &key)) return std::nullopt;
+  if (config_.srtp) {
+    // The answer must take up the key this side offered, by its tag (RFC 4568 section 5.1.3).
+    const auto accepted = std::find_if(answer->crypto.begin(), answer->crypto.end(),
+                                       [](const sip::SdesCrypto& crypto) { return crypto.tag == kOfferTag; });
+    if (accepted == answer->crypto.end()) return std::nullopt;
+    key = &*accepted;
+  }
+  return remote_media_for(call, *answer, key);
+}
+
+void UserAgent::start_ringback() {
+  if (call_->ringback) return;
+  call_->ringback = true;
+  host_.start_ringback();
+}
+
+void UserAgent::stop_ringback() {
+  if (!call_ || !call_->ringback) return;
+  call_->ringback = false;
+  host_.stop_ringback();
 }
 
 void UserAgent::send_ack_for_failure(const InviteContext& context, const sip::Message& response) {
@@ -400,6 +438,7 @@ void UserAgent::on_invite_final(const InviteContext& context, const sip::Message
     call.remote_header = to;
     call.remote_target = target;
     call.state = CallState::Confirmed;
+    stop_ringback();
     if (call.cancel_requested) {
       send_bye(now);
       end_call(shutting_down_ ? EndReason::Shutdown : EndReason::Local, 0);
@@ -591,6 +630,8 @@ CommandResult UserAgent::hangup(int32_t call_id, TimePoint now) {
   const EndReason reason = shutting_down_ ? EndReason::Shutdown : EndReason::Local;
   switch (call.state) {
     case CallState::Calling:
+      // The person gave up: the tone stops now, not when the server confirms the cancel.
+      stop_ringback();
       // CANCEL may only follow a provisional response; otherwise it goes out when one arrives.
       // The call ends when the INVITE gets its final response (normally 487).
       if (!call.cancel_requested) {
@@ -614,6 +655,7 @@ CommandResult UserAgent::hangup(int32_t call_id, TimePoint now) {
 
 void UserAgent::end_call(EndReason reason, int32_t status) {
   if (!call_) return;
+  stop_ringback();
   if (call_->media_open) host_.close_media();
   Event event;
   event.kind = EventKind::CallEnded;

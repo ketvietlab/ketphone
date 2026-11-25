@@ -5,8 +5,10 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -289,31 +291,116 @@ double share_at(const std::vector<int16_t>& samples, double hertz) {
 
 }  // namespace
 
-// Before the change: nothing is played while the call rings or carries early media, and the
-// speaker only gets audio once the call is answered.
+namespace {
 
-TEST(engine_today_plays_nothing_on_180_without_sdp) {
+constexpr double kRingbackHz = 425;
+constexpr double kCarrierHz = 1000;
+
+// The part of `samples` after the first `skip` ones, where a tone that just stopped has left the queue.
+std::vector<int16_t> after(const std::vector<int16_t>& samples, size_t skip) {
+  return {samples.begin() + static_cast<std::ptrdiff_t>(std::min(skip, samples.size())), samples.end()};
+}
+
+bool has_signal(const std::vector<int16_t>& samples) {
+  for (const int16_t sample : samples) {
+    if (std::abs(sample) > 200) return true;
+  }
+  return false;
+}
+
+}  // namespace
+
+TEST(a_180_without_sdp_plays_the_local_ringing_tone) {
   Caller caller;
   caller.server.reply(180);
   CHECK(Caller::wait_for([&] { return caller.events.count(KETPHONE_EVENT_CALL_PROGRESS) == 1; }));
   const auto heard = caller.listen(600ms);
-  CHECK_EQ(heard.real, size_t{0});
+  CHECK(heard.real > 0);
+  CHECK(share_at(heard.samples, kRingbackHz) > 0.8);
+  // A tone's worth of level, not silence padded in as audio.
+  CHECK(has_signal(heard.samples));
 }
 
-TEST(engine_today_ignores_the_sdp_of_a_183_and_plays_nothing) {
+TEST(a_183_with_sdp_plays_the_far_ends_audio_and_no_ringing_tone) {
   Caller caller;
   caller.server.reply(183, caller.server.sdp());
   CHECK(Caller::wait_for([&] { return caller.events.count(KETPHONE_EVENT_CALL_PROGRESS) == 1; }));
-  const auto heard = caller.listen(600ms, 1000);
-  CHECK_EQ(heard.real, size_t{0});
+  const auto heard = caller.listen(800ms, kCarrierHz);
+  CHECK(heard.real > 0);
+  const auto settled = after(heard.samples, 4000);
+  CHECK(share_at(settled, kCarrierHz) > 0.8);
+  CHECK(share_at(settled, kRingbackHz) < 0.01);
+  // The 180 that follows must not bring the local tone back over the carrier's.
+  caller.server.reply(180);
+  const auto later = caller.listen(600ms, kCarrierHz);
+  CHECK(share_at(after(later.samples, 1600), kRingbackHz) < 0.01);
+  CHECK(share_at(after(later.samples, 1600), kCarrierHz) > 0.8);
 }
 
-TEST(engine_plays_the_answered_call_after_a_200) {
+TEST(early_media_replaces_the_local_ringing_tone_that_a_180_started) {
+  Caller caller;
+  caller.server.reply(180);
+  const auto ringing = caller.listen(400ms);
+  CHECK(share_at(ringing.samples, kRingbackHz) > 0.8);
+  caller.server.reply(183, caller.server.sdp());
+  // A few frames of the tone may still be queued; after them only the carrier's sound plays.
+  const auto heard = caller.listen(800ms, kCarrierHz);
+  const auto settled = after(heard.samples, 4000);
+  CHECK(share_at(settled, kCarrierHz) > 0.8);
+  CHECK(share_at(settled, kRingbackHz) < 0.01);
+}
+
+TEST(the_local_ringing_tone_stops_when_the_call_is_answered) {
+  Caller caller;
+  caller.server.reply(180);
+  CHECK(share_at(caller.listen(400ms).samples, kRingbackHz) > 0.8);
+  caller.server.reply(200, caller.server.sdp());
+  CHECK(Caller::wait_for([&] { return caller.events.count(KETPHONE_EVENT_CALL_ANSWERED) == 1; }));
+  const auto answered = caller.listen(800ms, kCarrierHz);
+  const auto settled = after(answered.samples, 4000);
+  CHECK(share_at(settled, kCarrierHz) > 0.8);
+  CHECK(share_at(settled, kRingbackHz) < 0.01);
+}
+
+TEST(the_local_ringing_tone_stops_when_the_caller_hangs_up) {
+  Caller caller;
+  caller.server.reply(180);
+  CHECK(share_at(caller.listen(400ms).samples, kRingbackHz) > 0.8);
+  CHECK(ketphone_hangup(caller.engine, caller.call) == KETPHONE_OK);
+  const auto heard = caller.listen(500ms);
+  // Whatever was already queued plays out; nothing new is added.
+  CHECK(!has_signal(after(heard.samples, 2400)));
+  CHECK(Caller::wait_for([&] { return caller.events.count(KETPHONE_EVENT_CALL_ENDED) == 1; }));
+}
+
+TEST(the_local_ringing_tone_stops_when_the_call_is_refused) {
+  Caller caller;
+  caller.server.reply(180);
+  CHECK(share_at(caller.listen(400ms).samples, kRingbackHz) > 0.8);
+  caller.server.reply(486);
+  CHECK(Caller::wait_for([&] { return caller.events.count(KETPHONE_EVENT_CALL_ENDED) == 1; }));
+  const auto heard = caller.listen(500ms);
+  CHECK(!has_signal(after(heard.samples, 2400)));
+}
+
+TEST(the_audio_of_an_answered_call_is_the_far_ends_after_a_200) {
   Caller caller;
   caller.server.reply(180);
   caller.server.reply(200, caller.server.sdp());
   CHECK(Caller::wait_for([&] { return caller.events.count(KETPHONE_EVENT_CALL_ANSWERED) == 1; }));
-  const auto heard = caller.listen(600ms, 1000);
+  const auto heard = caller.listen(600ms, kCarrierHz);
   CHECK(heard.real > 0);
-  CHECK(share_at(heard.samples, 1000) > 0.5);
+  CHECK(share_at(after(heard.samples, 3200), kCarrierHz) > 0.8);
+}
+
+TEST(early_media_carries_on_into_the_answer) {
+  Caller caller;
+  caller.server.reply(183, caller.server.sdp());
+  CHECK(Caller::wait_for([&] { return caller.events.count(KETPHONE_EVENT_CALL_PROGRESS) == 1; }));
+  caller.listen(200ms, kCarrierHz);
+  caller.server.reply(200, caller.server.sdp());
+  CHECK(Caller::wait_for([&] { return caller.events.count(KETPHONE_EVENT_CALL_ANSWERED) == 1; }));
+  const auto heard = caller.listen(800ms, kCarrierHz);
+  CHECK(share_at(after(heard.samples, 3200), kCarrierHz) > 0.8);
+  CHECK_EQ(caller.events.count(KETPHONE_EVENT_CALL_ENDED), size_t{0});
 }
