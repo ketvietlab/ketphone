@@ -681,3 +681,30 @@ TEST(lost_connection_fails_requests_and_drops_registration_until_it_is_back) {
   idle.on_transport_down(t0());
   CHECK(idle.take_events().empty());
 }
+
+// Before the change a provisional response only produces an event: a 180 opens nothing, and the
+// SDP of a 183 is not looked at, so no media starts until the 200.
+
+TEST(today_180_without_sdp_only_reports_progress) {
+  FakeHost host;
+  UserAgent ua(config(), host);
+  register_ok(ua, host);
+  ua.call(7, "1002", t0());
+  const auto invite = host.last();
+  ua.on_message(respond(invite, 180), t0());
+  CHECK_EQ(events_of(ua, EventKind::CallProgress).size(), size_t{1});
+  CHECK(host.media.empty());
+}
+
+TEST(today_183_with_sdp_reports_progress_and_starts_no_media) {
+  FakeHost host;
+  UserAgent ua(config(), host);
+  register_ok(ua, host);
+  ua.call(7, "1002", t0());
+  const auto invite = host.last();
+  ua.on_message(respond(invite, 183, {}, "srv", kAnswer), t0());
+  const auto progress = events_of(ua, EventKind::CallProgress);
+  CHECK_EQ(progress.size(), size_t{1});
+  CHECK_EQ(progress[0].status, 183);
+  CHECK(host.media.empty());
+}
