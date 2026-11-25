@@ -337,8 +337,10 @@ void UserAgent::send_invite(const std::string& authorization, TimePoint now) {
 void UserAgent::on_invite_provisional(int32_t call_id, const sip::Message& response, TimePoint now) {
   if (!call_ || call_->id != call_id || call_->state != CallState::Calling) return;
   call_->provisional = true;
-  if (call_->cancel_requested && !call_->cancel_sent) {
-    send_cancel(now);
+  if (call_->cancel_requested) {
+    // The caller hung up. The first provisional lets the CANCEL go out; one that arrives later, or
+    // again, must not bring the tone or the far end's media back before the 487.
+    if (!call_->cancel_sent) send_cancel(now);
     return;
   }
   Call& call = *call_;

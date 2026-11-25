@@ -751,6 +751,31 @@ TEST(early_media_after_a_180_takes_over_from_the_ringing_tone) {
   CHECK_EQ(progress.size(), size_t{2});  // ringing, then early media
 }
 
+TEST(a_180_after_the_cancel_does_not_bring_the_ringing_tone_back) {
+  Dialling call;
+  call.reply(180);
+  CHECK(call.host.ringing());
+  CHECK(call.ua.hangup(7, t0()) == CommandResult::Ok);
+  CHECK(!call.host.ringing());
+  CHECK_EQ(call.host.last().method, std::string("CANCEL"));
+  // A late or repeated 180 from the server, and a 183 with the carrier's sound, before the 487.
+  call.reply(180);
+  call.reply(183, kAnswer);
+  CHECK(!call.host.ringing());
+  CHECK_EQ(call.host.ringback_started, 1);
+  CHECK(call.host.media.empty());
+}
+
+TEST(a_180_after_a_cancel_that_waited_for_a_provisional_does_not_start_the_tone) {
+  Dialling call;
+  CHECK(call.ua.hangup(7, t0()) == CommandResult::Ok);  // nothing has answered yet: the CANCEL waits
+  call.reply(180);
+  CHECK_EQ(call.host.last().method, std::string("CANCEL"));
+  call.reply(180);
+  CHECK_EQ(call.host.ringback_started, 0);
+  CHECK(call.host.media.empty());
+}
+
 TEST(a_183_the_agent_cannot_use_leaves_the_ringing_tone_to_the_180) {
   Dialling call;
   // No SDP, only another codec, and a stream the far end will not send on: none is early media.
