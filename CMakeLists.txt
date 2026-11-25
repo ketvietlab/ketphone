@@ -85,6 +85,7 @@ add_library(ketphone STATIC
   src/media/g711.cpp
   src/media/jitter_buffer.cpp
   src/media/media_session.cpp
+  src/media/ringback.cpp
   src/media/rtp.cpp
   src/media/srtp.cpp
   src/net/pem.cpp
@@ -126,11 +127,13 @@ if(KETPHONE_BUILD_TESTS)
     tests/c_api_test.cpp
     tests/base64_test.cpp
     tests/digest_test.cpp
+    tests/early_media_test.cpp
     tests/g711_test.cpp
     tests/jitter_buffer_test.cpp
     tests/message_test.cpp
     tests/network_simulation_test.cpp
     tests/ipv6_test.cpp
+    tests/ringback_test.cpp
     tests/rtp_test.cpp
     tests/sdp_test.cpp
     tests/spsc_ring_test.cpp

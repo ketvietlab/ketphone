@@ -29,6 +29,8 @@ class FakeHost : public UserAgentHost {
     return accept_media;
   }
   void close_media() override { ++media_closed; }
+  void start_ringback() override { ++ringback_started; }
+  void stop_ringback() override { ++ringback_stopped; }
 
   sip::Message last() const { return *sip::parse_message(sent.back()); }
   sip::Message at(size_t index) const { return *sip::parse_message(sent.at(index)); }
@@ -39,6 +41,9 @@ class FakeHost : public UserAgentHost {
   bool accept_media = true;
   int media_opened = 0;
   int media_closed = 0;
+  int ringback_started = 0;
+  int ringback_stopped = 0;
+  bool ringing() const { return ringback_started > ringback_stopped; }
 };
 
 UserAgentConfig config() {
@@ -680,4 +685,210 @@ TEST(lost_connection_fails_requests_and_drops_registration_until_it_is_back) {
   CHECK(idle_host.sent.empty());  // nobody asked to register
   idle.on_transport_down(t0());
   CHECK(idle.take_events().empty());
+}
+
+// Ringing tone and early media -------------------------------------------------------------------
+
+namespace {
+
+// An outgoing call whose INVITE is on the wire, the way the tests below start.
+struct Dialling {
+  FakeHost host;
+  UserAgent ua;
+  sip::Message invite;
+  Dialling(UserAgentConfig cfg = config()) : ua(std::move(cfg), host) {
+    register_ok(ua, host);
+    ua.call(7, "1002", t0());
+    invite = host.last();
+  }
+  void reply(int status, const std::string& body = {}, const std::string& extra = {}) {
+    ua.on_message(respond(invite, status, extra, "srv", body), t0());
+  }
+};
+
+const std::string kAnswerContact = "Contact: <sip:asterisk@127.0.0.1:5060>\r\n";
+
+}  // namespace
+
+TEST(a_180_without_sdp_starts_the_ringing_tone_and_opens_no_media) {
+  Dialling call;
+  call.reply(100);
+  CHECK(!call.host.ringing());
+  call.reply(180);
+  CHECK(call.host.ringing());
+  CHECK_EQ(call.host.ringback_started, 1);
+  CHECK(call.host.media.empty());
+  CHECK_EQ(events_of(call.ua, EventKind::CallProgress).size(), size_t{1});
+  // Asterisk repeats the 180 on a retransmission; the tone is not restarted.
+  call.reply(180);
+  CHECK_EQ(call.host.ringback_started, 1);
+}
+
+TEST(a_183_with_sdp_opens_the_far_ends_media_and_plays_no_tone_over_it) {
+  Dialling call;
+  call.reply(183, kAnswer);
+  CHECK_EQ(call.host.media.size(), size_t{1});
+  CHECK_EQ(call.host.media[0].port, uint16_t{10002});
+  CHECK_EQ(call.host.media[0].address, std::string("127.0.0.1"));
+  CHECK_EQ(call.host.ringback_started, 0);
+  const auto progress = events_of(call.ua, EventKind::CallProgress);
+  CHECK_EQ(progress.size(), size_t{1});
+  CHECK_EQ(progress[0].status, 183);
+  // A 180 after the early media does not bring the tone on top of the carrier's own sound.
+  call.reply(180);
+  CHECK_EQ(call.host.ringback_started, 0);
+}
+
+TEST(early_media_after_a_180_takes_over_from_the_ringing_tone) {
+  Dialling call;
+  call.reply(180);
+  CHECK(call.host.ringing());
+  call.reply(183, kAnswer);
+  CHECK(!call.host.ringing());
+  CHECK_EQ(call.host.ringback_stopped, 1);
+  CHECK_EQ(call.host.media.size(), size_t{1});
+  const auto progress = events_of(call.ua, EventKind::CallProgress);
+  CHECK_EQ(progress.size(), size_t{2});  // ringing, then early media
+}
+
+TEST(a_180_after_the_cancel_does_not_bring_the_ringing_tone_back) {
+  Dialling call;
+  call.reply(180);
+  CHECK(call.host.ringing());
+  CHECK(call.ua.hangup(7, t0()) == CommandResult::Ok);
+  CHECK(!call.host.ringing());
+  CHECK_EQ(call.host.last().method, std::string("CANCEL"));
+  // A late or repeated 180 from the server, and a 183 with the carrier's sound, before the 487.
+  call.reply(180);
+  call.reply(183, kAnswer);
+  CHECK(!call.host.ringing());
+  CHECK_EQ(call.host.ringback_started, 1);
+  CHECK(call.host.media.empty());
+}
+
+TEST(a_180_after_a_cancel_that_waited_for_a_provisional_does_not_start_the_tone) {
+  Dialling call;
+  CHECK(call.ua.hangup(7, t0()) == CommandResult::Ok);  // nothing has answered yet: the CANCEL waits
+  call.reply(180);
+  CHECK_EQ(call.host.last().method, std::string("CANCEL"));
+  call.reply(180);
+  CHECK_EQ(call.host.ringback_started, 0);
+  CHECK(call.host.media.empty());
+}
+
+TEST(a_183_the_agent_cannot_use_leaves_the_ringing_tone_to_the_180) {
+  Dialling call;
+  // No SDP, only another codec, and a stream the far end will not send on: none is early media.
+  call.reply(183);
+  CHECK(call.host.media.empty());
+  CHECK_EQ(call.host.ringback_started, 0);
+  call.reply(183,
+             "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=x\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n"
+             "m=audio 10002 RTP/AVP 18\r\na=rtpmap:18 G729/8000\r\n");
+  CHECK(call.host.media.empty());
+  call.reply(180);
+  CHECK(call.host.ringing());
+  CHECK(call.host.media.empty());
+}
+
+TEST(the_ringing_tone_stops_when_the_call_is_answered) {
+  Dialling call;
+  call.reply(180);
+  CHECK(call.host.ringing());
+  call.reply(200, kAnswer, kAnswerContact);
+  CHECK(!call.host.ringing());
+  CHECK_EQ(call.host.media.size(), size_t{1});
+  CHECK_EQ(events_of(call.ua, EventKind::CallAnswered).size(), size_t{1});
+}
+
+TEST(early_media_is_followed_into_the_answer) {
+  Dialling call;
+  call.reply(183, kAnswer);
+  call.reply(200, kAnswer, kAnswerContact);
+  // The 200's description is applied as well, in case it moved the far end.
+  CHECK_EQ(call.host.media.size(), size_t{2});
+  CHECK_EQ(events_of(call.ua, EventKind::CallAnswered).size(), size_t{1});
+  CHECK_EQ(call.host.ringback_started, 0);
+}
+
+TEST(the_ringing_tone_stops_at_once_when_the_caller_hangs_up) {
+  Dialling call;
+  call.reply(180);
+  CHECK(call.host.ringing());
+  CHECK(call.ua.hangup(7, t0()) == CommandResult::Ok);
+  CHECK(!call.host.ringing());  // before the server's 487
+  const auto cancel = call.host.last();
+  CHECK_EQ(cancel.method, std::string("CANCEL"));
+  call.ua.on_message(respond(cancel, 200), t0());
+  call.reply(487);
+  CHECK(!call.ua.has_call());
+  CHECK_EQ(call.host.ringback_stopped, 1);
+}
+
+TEST(the_ringing_tone_stops_when_the_call_is_refused_or_times_out) {
+  {
+    Dialling call;
+    call.reply(180);
+    call.reply(486);
+    CHECK(!call.host.ringing());
+    CHECK(!call.ua.has_call());
+  }
+  {
+    Dialling call;
+    call.reply(180);
+    call.ua.on_timer(t0() + 5min);  // the INVITE's own timer gives up
+    CHECK(!call.host.ringing());
+  }
+  {
+    Dialling call;
+    call.reply(180);
+    call.ua.shutdown(t0());
+    CHECK(!call.host.ringing());
+  }
+}
+
+TEST(a_ringing_incoming_call_never_starts_the_tone) {
+  FakeHost host;
+  UserAgent ua(config(), host);
+  register_ok(ua, host);
+  const std::string invite =
+      "INVITE sip:1001@192.168.1.20:50000 SIP/2.0\r\nVia: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bKx\r\n"
+      "From: <sip:1002@ketviet>;tag=f\r\nTo: <sip:1001@ketviet>\r\nCall-ID: in1\r\nCSeq: 1 INVITE\r\n"
+      "Contact: <sip:asterisk@127.0.0.1:5060>\r\nContent-Type: application/sdp\r\nContent-Length: " +
+      std::to_string(kAnswer.size()) + "\r\n\r\n" + kAnswer;
+  ua.on_message(invite, t0());
+  CHECK(ua.has_call());
+  CHECK(ua.answer(events_of(ua, EventKind::CallIncoming).at(0).call_id, t0()) == CommandResult::Ok);
+  CHECK_EQ(host.ringback_started, 0);
+  CHECK_EQ(host.ringback_stopped, 0);
+  CHECK_EQ(host.media.size(), size_t{1});
+}
+
+TEST(secure_early_media_must_take_up_the_offered_key) {
+  const auto theirs = test_key(9);
+  {
+    Dialling call(secure_config());
+    call.reply(183, secure_sdp(1, theirs, true));
+    CHECK_EQ(call.host.media.size(), size_t{1});
+    CHECK(call.host.media[0].srtp.has_value());
+    CHECK(call.host.media[0].srtp->remote == theirs);
+    CHECK_EQ(call.host.ringback_started, 0);
+  }
+  {
+    // Another tag is not the key this side offered; the sound is not played and the call goes on.
+    Dialling call(secure_config());
+    call.reply(183, secure_sdp(9, theirs, true));
+    CHECK(call.host.media.empty());
+    CHECK(call.ua.has_call());
+    call.reply(180);
+    CHECK(call.host.ringing());
+  }
+  {
+    // Keys the media layer refuses do not end the call; the 200 decides.
+    Dialling call(secure_config());
+    call.host.accept_media = false;
+    call.reply(183, secure_sdp(1, theirs, true));
+    CHECK(call.ua.has_call());
+    CHECK(!call.host.ringing());
+  }
 }

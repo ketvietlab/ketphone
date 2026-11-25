@@ -52,7 +52,11 @@ typedef enum ketphone_event_kind {
   KETPHONE_EVENT_REGISTRATION = 1,
   /* Someone is calling. remote and correlation_id are set; answer or reject by call_id. */
   KETPHONE_EVENT_CALL_INCOMING = 2,
-  /* The far end is ringing (status_code 180) or sent early media (183). Outgoing calls only. */
+  /* The far end is ringing (status_code 180) or sent early media (183). Outgoing calls only. The
+   * engine plays the sound itself: on a 180 without media it plays its own ringing tone through
+   * ketphone_audio_playout, and on a 183 with a usable SDP it plays what the far end sends. The
+   * caller hears neither unless audio is already running, so start it on this event, not at
+   * KETPHONE_EVENT_CALL_ANSWERED. */
   KETPHONE_EVENT_CALL_PROGRESS = 3,
   /* The call is connected and media is flowing. */
   KETPHONE_EVENT_CALL_ANSWERED = 4,

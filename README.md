@@ -12,6 +12,7 @@ The core speaks only standard SIP/RTP and knows nothing about any particular bac
 - INVITE/ACK/BYE/CANCEL/OPTIONS for both outgoing and incoming calls, with the RFC 3261 retransmission timers.
 - Single-stream audio SDP: PCMA (payload type 8) and telephone-event 101, ptime 20 ms.
 - IPv4 and IPv6 UDP signaling/media; IPv6 literals in SIP URIs and Via use brackets, while SDP uses `IN IP6`.
+- Ringing for the caller: a 180 plays a 425 Hz tone (1 s on, 4 s off) through the playout path, and a 183 whose SDP is usable plays the far end's early media instead; neither plays over the other, and both stop when the call is answered, refused, cancelled or ends.
 - Symmetric RTP. Receive statistics follow RFC 3550 (loss, jitter); an adaptive jitter buffer (see below) with simple loss concealment.
 - The realtime audio thread touches only two lock-free ring buffers: no allocation, no locks, no logging.
 

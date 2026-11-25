@@ -81,6 +81,10 @@ class UserAgentHost {
   // when the media cannot be secured as negotiated (SRTP keys refused); the call then ends.
   virtual bool start_media(const RemoteMedia& remote) = 0;
   virtual void close_media() = 0;
+  // The far end is ringing and sends no media of its own: play this side's ringing tone, until
+  // stop_ringback. Both are called only on outgoing calls, and stop_ringback may come without a start.
+  virtual void start_ringback() {}
+  virtual void stop_ringback() {}
 };
 
 enum class CommandResult { Ok, InvalidArgument, State, NotFound };
@@ -188,6 +192,10 @@ class UserAgent {
     bool authenticated = false;
     bool provisional = false;
     int32_t last_progress = 0;
+    // The ringing tone is playing here because the far end rings without media.
+    bool ringback = false;
+    // The far end's media was opened by a 183 and plays instead of the local ringing tone.
+    bool early_media = false;
     bool cancel_requested = false;
     bool cancel_sent = false;
     std::string ack;
@@ -239,6 +247,11 @@ class UserAgent {
 
   void send_invite(const std::string& authorization, TimePoint now);
   void on_invite_provisional(int32_t call_id, const sip::Message& response, TimePoint now);
+  // The far end's media as an answer to this side's offer describes it, or nothing when the answer
+  // has none this side can use.
+  std::optional<RemoteMedia> media_of_answer(const Call& call, const sip::Message& response) const;
+  void start_ringback();
+  void stop_ringback();
   void on_invite_final(const InviteContext& context, const sip::Message* response, TimePoint now);
   void send_ack_for_failure(const InviteContext& context, const sip::Message& response);
   void send_cancel(TimePoint now);

@@ -23,6 +23,7 @@
 #include "core/user_agent.hpp"
 #include "ketphone/ketphone.h"
 #include "media/media_session.hpp"
+#include "media/ringback.hpp"
 #include "media/spsc_ring.hpp"
 #include "media/srtp.hpp"
 #include "net/tls_transport.hpp"
@@ -39,6 +40,9 @@ constexpr Duration kFrame = 20ms;
 constexpr Duration kShutdownGrace = 2s;
 // 200 ms each way: enough for any audio callback size, small enough to bound added latency.
 constexpr size_t kRingSamples = 1600;
+// The ringing tone is only queued while the speaker has less than this waiting (three frames), so
+// the tone ends within about 60 ms of stop_ringback even when the audio thread had not started yet.
+constexpr size_t kRingbackQueuedSamples = 480;
 // A double-CRLF ping (RFC 5626 section 3.5.1) keeps NAT bindings and the server's view of the
 // connection fresh.
 constexpr Duration kKeepAlive = 30s;
@@ -276,13 +280,23 @@ class Engine final : public UserAgentHost {
     }
     if (endpoint == endpoints.end()) return true;
     rtp_remote_ = *endpoint;
+    ringback_active_ = false;  // the far end's own sound replaces the local tone
     if (media_.active()) return true;  // a re-INVITE only moves the far end or changes its key
     media_.start(sip::random_u32(), static_cast<uint16_t>(sip::random_u32()), sip::random_u32());
     next_frame_ = Clock::now();
     return true;
   }
 
+  void start_ringback() override {
+    ringback_.reset();
+    ringback_active_ = true;
+    next_ringback_ = Clock::now();
+  }
+
+  void stop_ringback() override { ringback_active_ = false; }
+
   void close_media() override {
+    ringback_active_ = false;
     if (media_.active()) publish_stats();
     media_.stop();
     rtp_.reset();
@@ -508,6 +522,7 @@ class Engine final : public UserAgentHost {
       TimePoint wake_at = now + 200ms;
       if (const auto deadline = ua_.next_deadline()) wake_at = std::min(wake_at, *deadline);
       if (media_.active()) wake_at = std::min(wake_at, next_frame_);
+      if (ringback_active_) wake_at = std::min(wake_at, next_ringback_);
       if (stopping_) wake_at = std::min(wake_at, stop_deadline_);
       if (tls_ && link_ == Link::Down) wake_at = std::min(wake_at, reconnect_at_);
       if (tls_ && link_ == Link::Up) wake_at = std::min(wake_at, keepalive_at_);
@@ -576,6 +591,19 @@ class Engine final : public UserAgentHost {
         publish_stats();
       }
 
+      if (ringback_active_ && now >= next_ringback_) {
+        // Catch up after a stall, but never burst more than a few frames.
+        if (now - next_ringback_ > 10 * kFrame) next_ringback_ = now;
+        while (now >= next_ringback_) {
+          if (playout_.size() < kRingbackQueuedSamples) {
+            std::array<int16_t, media::kFrameSamples> frame{};
+            ringback_.fill(frame);
+            playout_.push(frame.data(), frame.size());
+          }
+          next_ringback_ += kFrame;
+        }
+      }
+
       if (stopping_ && (ua_.idle() || Clock::now() >= stop_deadline_)) break;
     }
 
@@ -604,6 +632,9 @@ class Engine final : public UserAgentHost {
 
   std::atomic<int32_t> next_call_id_{1};
   TimePoint next_frame_{};
+  media::RingbackTone ringback_;
+  bool ringback_active_ = false;
+  TimePoint next_ringback_{};
 
   std::thread thread_;
   std::thread::id thread_id_;
