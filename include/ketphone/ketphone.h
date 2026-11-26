@@ -27,7 +27,7 @@
 extern "C" {
 #endif
 
-#define KETPHONE_API_VERSION 2
+#define KETPHONE_API_VERSION 3
 
 /* Audio frames crossing the API are signed 16-bit mono PCM at this rate. */
 #define KETPHONE_SAMPLE_RATE 8000
@@ -61,8 +61,24 @@ typedef enum ketphone_event_kind {
   /* The call is connected and media is flowing. */
   KETPHONE_EVENT_CALL_ANSWERED = 4,
   /* The call is over. end_reason says why; status_code carries the SIP status when there was one. */
-  KETPHONE_EVENT_CALL_ENDED = 5
+  KETPHONE_EVENT_CALL_ENDED = 5,
+  /* API version 3. The call's hold state, in hold (ketphone_hold_flags). Comes after
+   * ketphone_hold or ketphone_resume once the far end answered (status_code 200, or the SIP status
+   * that refused it: the call then goes on as it was), and when the far end holds or resumes
+   * (status_code 200). A caller built against an older version never asked for it and can ignore
+   * it. */
+  KETPHONE_EVENT_CALL_HOLD = 6
 } ketphone_event_kind;
+
+/* API version 3. Bits of ketphone_event.hold. */
+typedef enum ketphone_hold_flags {
+  KETPHONE_HOLD_NONE = 0,
+  /* This side holds the call: nothing is sent and what arrives is not played. */
+  KETPHONE_HOLD_LOCAL = 1,
+  /* The far end holds the call (its offer was sendonly or inactive): nothing is sent to it, and
+   * what it sends (music on hold, typically) is played. */
+  KETPHONE_HOLD_REMOTE = 2
+} ketphone_hold_flags;
 
 typedef enum ketphone_end_reason {
   KETPHONE_END_NONE = 0,
@@ -95,6 +111,8 @@ typedef struct ketphone_event {
   /* Value of the configured correlation header on incoming calls, which the app matches to the
    * VoIP push that woke it. "" when absent or not configured. Valid only during the callback. */
   const char *correlation_id;
+  /* API version 3. KETPHONE_EVENT_CALL_HOLD: ketphone_hold_flags bits; 0 on every other event. */
+  uint32_t hold;
 } ketphone_event;
 
 typedef void (*ketphone_event_callback)(const ketphone_event *event, void *context);
@@ -193,6 +211,24 @@ ketphone_result ketphone_reject(ketphone_engine *engine, ketphone_call_id call_i
 /* Ends a call in any state: cancels an unanswered outgoing call, declines an unanswered incoming
  * call with 603, or sends BYE to a connected one. */
 ketphone_result ketphone_hangup(ketphone_engine *engine, ketphone_call_id call_id);
+
+/* API version 3. Holds a connected call: a re-INVITE asks the far end to stop sending (sendonly, or
+ * inactive while the far end holds too); this side stops sending and playing at once when the far end
+ * accepts. ketphone_resume asks for media both ways again (recvonly while the far end still holds).
+ * The outcome arrives as KETPHONE_EVENT_CALL_HOLD. A request made while another is still out is sent
+ * after it, so the last one wins; asking for the state the call is already in reports it again.
+ * KETPHONE_ERROR_STATE when the call is not connected yet. */
+ketphone_result ketphone_hold(ketphone_engine *engine, ketphone_call_id call_id);
+ketphone_result ketphone_resume(ketphone_engine *engine, ketphone_call_id call_id);
+
+/* API version 3. Sends keys as RFC 4733 telephone events on the payload type the far end named for
+ * telephone-event/8000: "0"-"9", "*", "#" and "A"-"D". Each key is held duration_ms (0 means
+ * 160 ms; clamped to 40..5000 ms), sent every 20 ms in place of the microphone, ended by three
+ * final packets and followed by 60 ms of audio before the next key. Keys queue behind ones still
+ * being sent. KETPHONE_ERROR_INVALID_ARGUMENT for any other character; KETPHONE_ERROR_STATE when
+ * the call is not connected, is held, or the far end named no telephone-event type. */
+ketphone_result ketphone_send_dtmf(ketphone_engine *engine, ketphone_call_id call_id, const char *keys,
+                                   uint32_t duration_ms);
 
 /* Realtime audio thread only. Hands microphone samples to the engine. Returns how many were
  * accepted; the rest are dropped when the engine is not keeping up. */

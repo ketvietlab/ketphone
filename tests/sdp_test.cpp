@@ -130,3 +130,59 @@ TEST(built_secure_offer_round_trips_its_key) {
   CHECK(answer.find("m=audio 40000 RTP/AVP 8 101\r\n") != std::string::npos);
   CHECK(build_audio_sdp("192.168.1.5", 40000, 7, 1).find("a=crypto") == std::string::npos);
 }
+
+namespace {
+
+std::string with_audio_attributes(const std::string& payloads, const std::string& attributes) {
+  return "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 10000 RTP/AVP " + payloads +
+         "\r\na=rtpmap:8 PCMA/8000\r\n" + attributes;
+}
+
+}  // namespace
+
+TEST(reads_the_direction_of_the_audio_stream) {
+  const auto sendrecv = parse_audio(with_audio_attributes("8", "a=sendrecv\r\n"));
+  CHECK(sendrecv->remote_sends && sendrecv->remote_receives);
+  const auto none = parse_audio(with_audio_attributes("8", ""));
+  CHECK(none->remote_sends && none->remote_receives);
+  const auto sendonly = parse_audio(with_audio_attributes("8", "a=sendonly\r\n"));
+  CHECK(sendonly->remote_sends && !sendonly->remote_receives);
+  const auto recvonly = parse_audio(with_audio_attributes("8", "a=recvonly\r\n"));
+  CHECK(!recvonly->remote_sends && recvonly->remote_receives);
+  const auto inactive = parse_audio(with_audio_attributes("8", "a=inactive\r\n"));
+  CHECK(!inactive->remote_sends && !inactive->remote_receives);
+}
+
+TEST(reads_the_telephone_event_payload_type_only_when_mapped_and_listed) {
+  CHECK(parse_audio(with_audio_attributes("8 101", "a=rtpmap:101 telephone-event/8000\r\n"))->telephone_event ==
+        std::optional<uint8_t>(101));
+  CHECK(parse_audio(with_audio_attributes("8 96", "a=rtpmap:96 TELEPHONE-EVENT/8000\r\n"))->telephone_event ==
+        std::optional<uint8_t>(96));
+  // Listed without a mapping, mapped without being listed, or at another rate: no events.
+  CHECK(!parse_audio(with_audio_attributes("8 101", ""))->telephone_event);
+  CHECK(!parse_audio(with_audio_attributes("8", "a=rtpmap:101 telephone-event/8000\r\n"))->telephone_event);
+  CHECK(!parse_audio(with_audio_attributes("8 101", "a=rtpmap:101 telephone-event/16000\r\n"))->telephone_event);
+  // A-law's own number is never taken for events.
+  CHECK(!parse_audio(with_audio_attributes("8", "a=rtpmap:8 telephone-event/8000\r\n"))->telephone_event);
+}
+
+TEST(builds_each_direction_and_the_given_telephone_event_type) {
+  const std::string hold = build_audio_sdp("10.0.0.1", 4000, 1, 2, std::nullopt, Direction::SendOnly);
+  CHECK(hold.find("a=sendonly\r\n") != std::string::npos);
+  CHECK(hold.find("a=sendrecv") == std::string::npos);
+  CHECK(hold.find("m=audio 4000 RTP/AVP 8 101\r\n") != std::string::npos);
+  CHECK(build_audio_sdp("10.0.0.1", 4000, 1, 2, std::nullopt, Direction::Inactive).find("a=inactive\r\n") !=
+        std::string::npos);
+  CHECK(build_audio_sdp("10.0.0.1", 4000, 1, 2, std::nullopt, Direction::RecvOnly).find("a=recvonly\r\n") !=
+        std::string::npos);
+  const std::string other = build_audio_sdp("10.0.0.1", 4000, 1, 2, std::nullopt, Direction::SendRecv, 96);
+  CHECK(other.find("m=audio 4000 RTP/AVP 8 96\r\n") != std::string::npos);
+  CHECK(other.find("a=rtpmap:96 telephone-event/8000\r\na=fmtp:96 0-16\r\n") != std::string::npos);
+  const std::string bare = build_audio_sdp("10.0.0.1", 4000, 1, 2, std::nullopt, Direction::SendRecv, std::nullopt);
+  CHECK(bare.find("m=audio 4000 RTP/AVP 8\r\n") != std::string::npos);
+  CHECK(bare.find("telephone-event") == std::string::npos);
+  CHECK(direction_of(true, true) == Direction::SendRecv);
+  CHECK(direction_of(true, false) == Direction::SendOnly);
+  CHECK(direction_of(false, true) == Direction::RecvOnly);
+  CHECK(direction_of(false, false) == Direction::Inactive);
+}

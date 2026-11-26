@@ -127,8 +127,10 @@ if(KETPHONE_BUILD_TESTS)
     tests/c_api_test.cpp
     tests/base64_test.cpp
     tests/digest_test.cpp
+    tests/dtmf_test.cpp
     tests/early_media_test.cpp
     tests/g711_test.cpp
+    tests/hold_dtmf_test.cpp
     tests/jitter_buffer_test.cpp
     tests/message_test.cpp
     tests/network_simulation_test.cpp

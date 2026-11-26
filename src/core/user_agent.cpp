@@ -40,6 +40,12 @@ std::string branch_of(const sip::Message& message) {
   return sip::param_of(top, "branch").value_or("");
 }
 
+// RFC 4733 keys this side sends.
+bool dtmf_key(char key) {
+  return (key >= '0' && key <= '9') || key == '*' || key == '#' || (key >= 'A' && key <= 'D') ||
+         (key >= 'a' && key <= 'd');
+}
+
 // RFC 3261 requires brackets around IPv6 literals in SIP URIs and Via sent-by.
 std::string sip_host(const std::string& address) {
   if (address.find(':') != std::string::npos && !address.starts_with('[')) return "[" + address + "]";
@@ -87,6 +93,7 @@ std::string UserAgent::local_sdp_for(Call& call, const sip::AudioDescription* an
     sip::LocalCrypto local;
     local.key = call.srtp_key;
     local.tag = kOfferTag;
+    local.savp = call.savp;
     const sip::SdesCrypto* chosen = nullptr;
     if (answering != nullptr && acceptable(*answering, &chosen)) {
       // An answer keeps the offer's profile and accepts the chosen line by its tag.
@@ -95,7 +102,25 @@ std::string UserAgent::local_sdp_for(Call& call, const sip::AudioDescription* an
     }
     crypto = local;
   }
-  return sip::build_audio_sdp(config_.local_address, call.media_port, call.sdp_session, call.sdp_version++, crypto);
+  // An offer asks for the hold this side wants and leaves out what the far end's hold stops; an
+  // answer mirrors the offer (RFC 3264 section 6.1, RFC 6337 section 5).
+  sip::Direction direction = sip::direction_of(!call.remote_hold, !call.want_hold);
+  std::optional<uint8_t> telephone_event = sip::kPayloadTelephoneEvent;
+  if (answering != nullptr) {
+    direction = sip::direction_of(answering->remote_receives, answering->remote_sends && !call.local_hold);
+    // The answer uses the offer's number for the events, or leaves them out like the offer did.
+    telephone_event = answering->telephone_event;
+  }
+  const auto build = [&](uint64_t version) {
+    return sip::build_audio_sdp(config_.local_address, call.media_port, call.sdp_session, version, crypto, direction,
+                                telephone_event);
+  };
+  if (!call.local_sdp.empty()) {
+    std::string same = build(call.sdp_version);
+    if (same == call.local_sdp) return same;
+    ++call.sdp_version;
+  }
+  return build(call.sdp_version);
 }
 
 RemoteMedia UserAgent::remote_media_for(const Call& call, const sip::AudioDescription& media,
@@ -104,6 +129,10 @@ RemoteMedia UserAgent::remote_media_for(const Call& call, const sip::AudioDescri
   remote.address = media.address;
   remote.port = media.port;
   if (config_.srtp && key != nullptr) remote.srtp = MediaKeys{call.srtp_key, key->key};
+  // Holding stops both ways here; the far end's own hold stops what it would not take.
+  remote.send = !call.local_hold && media.remote_receives;
+  remote.receive = !call.local_hold && media.remote_sends;
+  remote.telephone_event = media.telephone_event;
   return remote;
 }
 
@@ -414,15 +443,7 @@ void UserAgent::on_invite_final(const InviteContext& context, const sip::Message
     const std::string to(response->header("to").value_or(""));
     const auto contact_header = response->header("contact");
     const std::string target = contact_header ? sip::uri_of(*contact_header) : context.uri;
-    Request ack;
-    ack.method = "ACK";
-    ack.uri = target;
-    ack.from = context.from;
-    ack.to = to;
-    ack.call_id = context.sip_call_id;
-    ack.cseq = context.cseq;
-    const std::string ack_bytes = build_request(ack, "z9hG4bK" + sip::random_hex(10));
-    send_raw(ack_bytes);
+    const std::string ack_bytes = send_ack_for_success(context, *response);
 
     if (!ours) {
       Request bye;
@@ -437,6 +458,7 @@ void UserAgent::on_invite_final(const InviteContext& context, const sip::Message
     }
     Call& call = *call_;
     call.ack = ack_bytes;
+    call.ack_cseq = context.cseq;
     call.remote_header = to;
     call.remote_target = target;
     call.state = CallState::Confirmed;
@@ -456,7 +478,11 @@ void UserAgent::on_invite_final(const InviteContext& context, const sip::Message
       key = accepted == answer->crypto.end() ? nullptr : &*accepted;
       usable = key != nullptr;
     }
-    if (!usable || !host_.start_media(remote_media_for(call, *answer, key))) {
+    if (usable) {
+      call.savp = answer->savp;
+      call.media = remote_media_for(call, *answer, key);
+    }
+    if (!usable || !host_.start_media(call.media)) {
       send_bye(now);
       end_call(EndReason::MediaFailed, 488);
       return;
@@ -489,6 +515,166 @@ void UserAgent::on_invite_final(const InviteContext& context, const sip::Message
   } else {
     end_call(EndReason::Rejected, status);
   }
+}
+
+std::string UserAgent::send_ack_for_success(const InviteContext& context, const sip::Message& response) {
+  const auto contact_header = response.header("contact");
+  Request ack;
+  ack.method = "ACK";
+  ack.uri = contact_header ? sip::uri_of(*contact_header) : context.uri;
+  ack.from = context.from;
+  ack.to = std::string(response.header("to").value_or(""));
+  ack.call_id = context.sip_call_id;
+  ack.cseq = context.cseq;
+  std::string bytes = build_request(ack, "z9hG4bK" + sip::random_hex(10));
+  send_raw(bytes);
+  return bytes;
+}
+
+// Hold ------------------------------------------------------------------------------------------
+
+CommandResult UserAgent::hold(int32_t call_id, bool on, TimePoint now) {
+  if (!call_ || call_->id != call_id) return CommandResult::NotFound;
+  Call& call = *call_;
+  if (call.state != CallState::Confirmed) return CommandResult::State;
+  call.want_hold = on;
+  if (call.reinvite_in_flight || call.reinvite_retry_at) return CommandResult::Ok;  // goes after it
+  if (call.local_hold == on) {
+    emit_hold(200);  // already so; the caller still hears how it stands
+    return CommandResult::Ok;
+  }
+  send_reinvite({}, now);
+  return CommandResult::Ok;
+}
+
+void UserAgent::send_reinvite(const std::string& authorization, TimePoint now) {
+  Call& call = *call_;
+  call.reinvite_retry_at.reset();
+  call.reinvite_in_flight = true;
+  // An offer sent again with credentials is the same offer.
+  if (authorization.empty()) {
+    call.reinvite_hold = call.want_hold;
+    call.reinvite_sdp = local_sdp_for(call, nullptr);
+  }
+
+  Request request;
+  request.method = "INVITE";
+  request.uri = call.remote_target;
+  request.from = call.local_header;
+  request.to = call.remote_header;
+  request.call_id = call.sip_call_id;
+  request.cseq = call.local_cseq++;
+  request.extra.emplace_back("Allow", kAllow);
+  if (!authorization.empty()) {
+    const size_t colon = authorization.find(':');
+    request.extra.emplace_back(authorization.substr(0, colon), std::string(sip::trim(authorization.substr(colon + 1))));
+  }
+  request.body = call.reinvite_sdp;
+
+  InviteContext context;
+  context.call_id = call.id;
+  context.uri = request.uri;
+  context.from = request.from;
+  context.sip_call_id = request.call_id;
+  context.cseq = request.cseq;
+  context.branch = "z9hG4bK" + sip::random_hex(10);
+  call.reinvite_branch = context.branch;
+  send_request(
+      request, now,
+      [this, context](const sip::Message* response, TimePoint at) { on_reinvite_final(context, response, at); }, {},
+      context.branch);
+}
+
+void UserAgent::on_reinvite_final(const InviteContext& context, const sip::Message* response, TimePoint now) {
+  const bool ours = call_ && call_->id == context.call_id && call_->reinvite_branch == context.branch;
+  if (response && response->status >= 300) send_ack_for_failure(context, *response);
+  std::string ack;
+  if (response && response->status < 300) ack = send_ack_for_success(context, *response);
+  if (!ours) return;  // the call ended meanwhile; its BYE is out already
+
+  Call& call = *call_;
+  call.reinvite_in_flight = false;
+  const int32_t status = response ? response->status : 408;
+  if ((status == 401 || status == 407) && !call.reinvite_authenticated) {
+    if (const auto authorization = authorization_for(*response, "INVITE", call.remote_target)) {
+      call.reinvite_authenticated = true;
+      send_reinvite(*authorization, now);
+      return;
+    }
+  }
+  call.reinvite_authenticated = false;
+
+  if (status >= 200 && status < 300) {
+    call.ack = std::move(ack);
+    call.ack_cseq = context.cseq;
+    const auto answer = sip::parse_audio(response->body);
+    const sip::SdesCrypto* key = nullptr;
+    bool usable = answer && acceptable(*answer, &key);
+    if (usable && config_.srtp) {
+      const auto accepted = std::find_if(answer->crypto.begin(), answer->crypto.end(),
+                                         [](const sip::SdesCrypto& crypto) { return crypto.tag == kOfferTag; });
+      key = accepted == answer->crypto.end() ? nullptr : &*accepted;
+      usable = key != nullptr;
+    }
+    const bool previous = call.local_hold;
+    call.local_hold = call.reinvite_hold;
+    RemoteMedia media;
+    if (usable) media = remote_media_for(call, *answer, key);
+    // An answer this side cannot use leaves no media both sides agree on (RFC 3261 section 14.1).
+    if (!usable || !host_.start_media(media)) {
+      call.local_hold = previous;
+      send_bye(now);
+      end_call(EndReason::MediaFailed, 488);
+      return;
+    }
+    call.media = std::move(media);
+    call.local_sdp = call.reinvite_sdp;
+    emit_hold(status);
+    // The person changed their mind while the far end was answering.
+    if (call.want_hold != call.local_hold) send_reinvite({}, now);
+    return;
+  }
+
+  if (status == 491) {
+    // Both sides sent a re-INVITE at once. The side that made the call waits 2.1 to 4 s, the other
+    // up to 2 s, so the two do not collide again.
+    const uint32_t jitter = sip::random_u32() % 1000;
+    const Duration wait = call.outgoing ? std::chrono::milliseconds(2100 + jitter * 19 / 10)
+                                        : std::chrono::milliseconds(jitter * 2);
+    call.reinvite_retry_at = now + wait;
+    return;
+  }
+  if (status == 481 || status == 408) {
+    // The dialog is gone at the far end, or nothing answers in it (RFC 3261 section 12.2.1.2).
+    if (status == 408) send_bye(now);
+    end_call(status == 408 ? EndReason::Timeout : EndReason::RemoteHangup, status);
+    return;
+  }
+  // Refused: the call goes on as it was.
+  call.want_hold = call.local_hold;
+  emit_hold(status);
+}
+
+void UserAgent::emit_hold(int32_t status) {
+  Event event;
+  event.kind = EventKind::CallHold;
+  event.call_id = call_->id;
+  event.status = status;
+  event.remote = call_->remote_uri;
+  event.remote_display_name = call_->remote_display_name;
+  event.local_hold = call_->local_hold;
+  event.remote_hold = call_->remote_hold;
+  emit(std::move(event));
+}
+
+CommandResult UserAgent::send_dtmf(int32_t call_id, std::string_view keys, uint32_t duration_ms, TimePoint) {
+  if (keys.empty() || !std::all_of(keys.begin(), keys.end(), dtmf_key)) return CommandResult::InvalidArgument;
+  if (!call_ || call_->id != call_id) return CommandResult::NotFound;
+  const Call& call = *call_;
+  if (call.state != CallState::Confirmed || call.local_hold || !call.media.send || !call.media.telephone_event) {
+    return CommandResult::State;
+  }
+  return host_.send_dtmf(keys, duration_ms) ? CommandResult::Ok : CommandResult::State;
 }
 
 void UserAgent::send_cancel(TimePoint now) {
@@ -526,22 +712,36 @@ void UserAgent::on_invite_request(const sip::Message& request, TimePoint now) {
       if (!call_->last_response.empty()) send_raw(call_->last_response);
       return;
     }
-    // A re-INVITE inside the dialog, e.g. the server moving media or changing keys. Follow it if
-    // it is usable.
+    // A re-INVITE inside the dialog: the server moving media, changing keys, or the far end
+    // holding or resuming. Follow it if it is usable.
+    if (call_->reinvite_in_flight) {
+      // Ours is out and unanswered; one of the two must go again later (RFC 3261 section 14.2).
+      send_raw(build_response(request, 491, {}));
+      return;
+    }
     const auto offer = sip::parse_audio(request.body);
     const sip::SdesCrypto* key = nullptr;
     if (request.body.empty() || !offer || !acceptable(*offer, &key)) {
       send_raw(build_response(request, 488, {}));
       return;
     }
-    // With SRTP the answer names the crypto line it takes, so it is rebuilt; this side's key stays.
-    std::string answer = config_.srtp ? local_sdp_for(*call_, &*offer) : call_->local_sdp;
-    if (!host_.start_media(remote_media_for(*call_, *offer, key))) {
+    Call& call = *call_;
+    const bool was_held = call.remote_hold;
+    // A hold arrives as sendonly or inactive: the far end takes no media.
+    call.remote_hold = !offer->remote_receives;
+    // With SRTP the answer names the crypto line it takes; this side's key stays.
+    std::string answer = local_sdp_for(call, &*offer);
+    RemoteMedia media = remote_media_for(call, *offer, key);
+    if (!host_.start_media(media)) {
+      call.remote_hold = was_held;
       send_raw(build_response(request, 488, {}));
       return;
     }
-    call_->local_sdp = std::move(answer);
-    send_raw(build_response(request, 200, {}, call_->local_sdp));
+    call.media = std::move(media);
+    call.savp = offer->savp;
+    call.local_sdp = std::move(answer);
+    send_raw(build_response(request, 200, {}, call.local_sdp));
+    if (call.remote_hold != was_held) emit_hold(200);
     return;
   }
 
@@ -573,6 +773,8 @@ void UserAgent::on_invite_request(const sip::Message& request, TimePoint now) {
   call.local_cseq = 1;
   call.invite = request;
   call.offer = *offer;
+  call.remote_hold = !offer->remote_receives;
+  call.savp = offer->savp;
   if (!config_.correlation_header.empty()) {
     call.correlation_id = std::string(request.header(sip::lowercase(config_.correlation_header)).value_or(""));
   }
@@ -602,7 +804,9 @@ CommandResult UserAgent::answer(int32_t call_id, TimePoint now) {
   acceptable(call.offer, &key);
   // Media starts before the 200 goes out so the first words are not clipped while the ACK is on
   // its way, and so that keys the media layer refuses never reach the far end.
-  if (port == 0 || !new_srtp_key(call) || !host_.start_media(remote_media_for(call, call.offer, key))) {
+  const bool keyed = port != 0 && new_srtp_key(call);
+  if (keyed) call.media = remote_media_for(call, call.offer, key);
+  if (!keyed || !host_.start_media(call.media)) {
     send_raw(build_response(*call.invite, 500, call.local_tag));
     end_call(EndReason::MediaFailed, 500);
     return CommandResult::Ok;
@@ -719,7 +923,8 @@ void UserAgent::on_response(const sip::Message& response, TimePoint now) {
   if (it == transactions_.end()) {
     // A retransmitted 2xx means our ACK was lost; send it again.
     if (response.status >= 200 && response.status < 300 && cseq->method == "INVITE" && call_ &&
-        call_->sip_call_id == response.header("call-id").value_or("") && !call_->ack.empty()) {
+        call_->sip_call_id == response.header("call-id").value_or("") && !call_->ack.empty() &&
+        cseq->number == call_->ack_cseq) {
       send_raw(call_->ack);
     }
     return;
@@ -811,6 +1016,10 @@ void UserAgent::on_timer(TimePoint now) {
     if (transaction.on_final) transaction.on_final(nullptr, now);
   }
 
+  if (call_ && call_->reinvite_retry_at && now >= *call_->reinvite_retry_at && !call_->reinvite_in_flight) {
+    send_reinvite({}, now);
+  }
+
   if (call_ && call_->state == CallState::Answering) {
     if (now >= call_->ack_deadline) {
       send_bye(now);
@@ -838,6 +1047,7 @@ std::optional<TimePoint> UserAgent::next_deadline() const {
     consider(transaction.deadline);
     if (transaction.retransmitting) consider(transaction.retransmit_at);
   }
+  if (call_ && call_->reinvite_retry_at) consider(*call_->reinvite_retry_at);
   if (call_ && call_->state == CallState::Answering) {
     consider(call_->resend_at);
     consider(call_->ack_deadline);
