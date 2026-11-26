@@ -29,6 +29,10 @@ class FakeHost : public UserAgentHost {
     return accept_media;
   }
   void close_media() override { ++media_closed; }
+  bool send_dtmf(std::string_view keys, uint32_t duration_ms) override {
+    dtmf.emplace_back(std::string(keys), duration_ms);
+    return true;
+  }
   void start_ringback() override { ++ringback_started; }
   void stop_ringback() override { ++ringback_stopped; }
 
@@ -37,6 +41,7 @@ class FakeHost : public UserAgentHost {
 
   std::vector<std::string> sent;
   std::vector<RemoteMedia> media;
+  std::vector<std::pair<std::string, uint32_t>> dtmf;
   uint16_t media_port = 40000;
   bool accept_media = true;
   int media_opened = 0;
@@ -891,4 +896,378 @@ TEST(secure_early_media_must_take_up_the_offered_key) {
     CHECK(call.ua.has_call());
     CHECK(!call.host.ringing());
   }
+}
+
+// Hold and resume -------------------------------------------------------------------------------
+
+namespace {
+
+// Asterisk's answer, with the telephone-event mapping it sends and the given direction.
+std::string answer_sdp(const std::string& direction, uint16_t port = 10002, int event = 101) {
+  return "v=0\r\no=- 1 2 IN IP4 127.0.0.1\r\ns=Asterisk\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n"
+         "m=audio " + std::to_string(port) + " RTP/AVP 8 " + std::to_string(event) + "\r\na=rtpmap:8 PCMA/8000\r\n"
+         "a=rtpmap:" + std::to_string(event) + " telephone-event/8000\r\na=fmtp:" + std::to_string(event) +
+         " 0-16\r\na=" + direction + "\r\n";
+}
+
+std::string with_body(std::string request, const std::string& body) {
+  request.replace(request.find("Content-Length: 0"), 17,
+                  "Content-Type: application/sdp\r\nContent-Length: " + std::to_string(body.size()));
+  return request + body;
+}
+
+const std::string kContact = "Contact: <sip:asterisk@127.0.0.1:5060>\r\n";
+
+// An outgoing call to 1002, answered with `answer` and acknowledged.
+void connect_outgoing(UserAgent& ua, FakeHost& host, const std::string& answer = answer_sdp("sendrecv")) {
+  register_ok(ua, host);
+  CHECK(ua.call(7, "1002", t0()) == CommandResult::Ok);
+  ua.on_message(respond(host.last(), 200, kContact, "srv", answer), t0());
+  CHECK_EQ(host.last().method, std::string("ACK"));
+  CHECK_EQ(events_of(ua, EventKind::CallAnswered).size(), size_t{1});
+}
+
+// An incoming call from 1002, answered and acknowledged; returns this side's tag.
+std::string connect_incoming(UserAgent& ua, FakeHost& host, int32_t& id) {
+  register_ok(ua, host);
+  ua.on_message(incoming_invite("hold-in", answer_sdp("sendrecv")), t0());
+  id = events_of(ua, EventKind::CallIncoming).at(0).call_id;
+  CHECK(ua.answer(id, t0()) == CommandResult::Ok);
+  const std::string tag = *sip::param_of(*host.last().header("to"), "tag");
+  ua.on_message(in_dialog("ACK", "hold-in", 102, tag), t0());
+  ua.take_events();
+  return tag;
+}
+
+bool has_line(const sip::Message& message, const std::string& line) {
+  return message.body.find(line + "\r\n") != std::string::npos;
+}
+
+uint32_t cseq_of(const sip::Message& message) { return sip::parse_cseq(*message.header("cseq"))->number; }
+
+}  // namespace
+
+TEST(hold_sends_a_sendonly_reinvite_in_the_dialog_and_stops_media_once_accepted) {
+  FakeHost host;
+  UserAgent ua(config(), host);
+  connect_outgoing(ua, host);
+  const auto invite = host.at(0);
+  CHECK(host.media.back().send && host.media.back().receive);
+
+  CHECK(ua.hold(7, true, t0()) == CommandResult::Ok);
+  const auto reinvite = host.last();
+  CHECK_EQ(reinvite.method, std::string("INVITE"));
+  CHECK_EQ(reinvite.uri, std::string("sip:asterisk@127.0.0.1:5060"));  // the remote target
+  CHECK_EQ(std::string(*reinvite.header("call-id")), std::string(*invite.header("call-id")));
+  CHECK(std::string(*reinvite.header("to")).find("tag=srv") != std::string::npos);
+  CHECK(cseq_of(reinvite) > cseq_of(invite));
+  CHECK(has_line(reinvite, "a=sendonly"));
+  CHECK(!has_line(reinvite, "a=sendrecv"));
+  // The same session, one version on.
+  CHECK(reinvite.body.find("o=- ") != std::string::npos);
+  CHECK(sip::parse_audio(reinvite.body)->port == uint16_t{40000});
+  // Nothing changes before the far end accepts.
+  CHECK(!ua.local_hold());
+  CHECK(events_of(ua, EventKind::CallHold).empty());
+
+  const size_t media_before = host.media.size();
+  ua.on_message(respond(reinvite, 200, kContact, "srv", answer_sdp("recvonly")), t0());
+  const auto ack = host.last();
+  CHECK_EQ(ack.method, std::string("ACK"));
+  CHECK_EQ(cseq_of(ack), cseq_of(reinvite));
+  CHECK(ack.header("via").value() != reinvite.header("via").value());
+  CHECK(ua.local_hold());
+  CHECK_EQ(host.media.size(), media_before + 1);
+  CHECK(!host.media.back().send);
+  CHECK(!host.media.back().receive);
+  const auto held = events_of(ua, EventKind::CallHold);
+  CHECK_EQ(held.size(), size_t{1});
+  CHECK_EQ(held[0].call_id, 7);
+  CHECK_EQ(held[0].status, 200);
+  CHECK(held[0].local_hold);
+  CHECK(!held[0].remote_hold);
+
+  // A retransmitted 200 to the re-INVITE gets its own ACK again.
+  ua.on_message(respond(reinvite, 200, kContact, "srv", answer_sdp("recvonly")), t0());
+  CHECK_EQ(host.last().header("via").value(), ack.header("via").value());
+
+  // DTMF is refused while held.
+  CHECK(ua.send_dtmf(7, "1", 0, t0()) == CommandResult::State);
+
+  CHECK(ua.hold(7, false, t0()) == CommandResult::Ok);
+  const auto resume = host.last();
+  CHECK(has_line(resume, "a=sendrecv"));
+  CHECK(cseq_of(resume) > cseq_of(reinvite));
+  ua.on_message(respond(resume, 200, kContact, "srv", answer_sdp("sendrecv")), t0());
+  CHECK(!ua.local_hold());
+  CHECK(host.media.back().send && host.media.back().receive);
+  const auto resumed = events_of(ua, EventKind::CallHold);
+  CHECK_EQ(resumed.size(), size_t{1});
+  CHECK(!resumed[0].local_hold);
+
+  // The BYE comes after both re-INVITEs in the CSeq order.
+  CHECK(ua.hangup(7, t0()) == CommandResult::Ok);
+  CHECK(cseq_of(host.last()) > cseq_of(resume));
+}
+
+TEST(hold_is_refused_before_the_call_connects_and_reports_an_unchanged_state) {
+  FakeHost host;
+  UserAgent ua(config(), host);
+  register_ok(ua, host);
+  CHECK(ua.hold(7, true, t0()) == CommandResult::NotFound);
+  CHECK(ua.call(7, "1002", t0()) == CommandResult::Ok);
+  CHECK(ua.hold(7, true, t0()) == CommandResult::State);
+  CHECK(ua.send_dtmf(7, "1", 0, t0()) == CommandResult::State);
+  ua.on_message(respond(host.last(), 200, kContact, "srv", answer_sdp("sendrecv")), t0());
+  ua.take_events();
+  // Resuming a call that is not held sends nothing and says how it stands.
+  const size_t sent = host.sent.size();
+  CHECK(ua.hold(7, false, t0()) == CommandResult::Ok);
+  CHECK_EQ(host.sent.size(), sent);
+  const auto events = events_of(ua, EventKind::CallHold);
+  CHECK_EQ(events.size(), size_t{1});
+  CHECK(!events[0].local_hold);
+}
+
+TEST(a_refused_hold_leaves_the_call_as_it_was) {
+  FakeHost host;
+  UserAgent ua(config(), host);
+  connect_outgoing(ua, host);
+  CHECK(ua.hold(7, true, t0()) == CommandResult::Ok);
+  const auto reinvite = host.last();
+  const size_t media_before = host.media.size();
+  ua.on_message(respond(reinvite, 488, {}, "srv"), t0());
+  CHECK_EQ(host.last().method, std::string("ACK"));
+  CHECK_EQ(host.last().header("via").value(), reinvite.header("via").value());  // non-2xx ACK: same branch
+  CHECK(!ua.local_hold());
+  CHECK(ua.has_call());
+  CHECK_EQ(host.media.size(), media_before);
+  const auto events = events_of(ua, EventKind::CallHold);
+  CHECK_EQ(events.size(), size_t{1});
+  CHECK_EQ(events[0].status, 488);
+  CHECK(!events[0].local_hold);
+  // The call still takes keys.
+  CHECK(ua.send_dtmf(7, "5", 0, t0()) == CommandResult::Ok);
+}
+
+TEST(hold_authenticates_when_challenged) {
+  FakeHost host;
+  UserAgent ua(config(), host);
+  connect_outgoing(ua, host);
+  CHECK(ua.hold(7, true, t0()) == CommandResult::Ok);
+  const auto reinvite = host.last();
+  ua.on_message(respond(reinvite, 407, kProxyChallenge, "srv"), t0());
+  const auto authed = host.last();
+  CHECK_EQ(authed.method, std::string("INVITE"));
+  CHECK(authed.header("proxy-authorization").has_value());
+  CHECK(digest_valid(std::string(*authed.header("proxy-authorization")), "INVITE"));
+  CHECK(has_line(authed, "a=sendonly"));
+  CHECK_EQ(authed.body, reinvite.body);  // the same offer
+  ua.on_message(respond(authed, 200, kContact, "srv", answer_sdp("recvonly")), t0());
+  CHECK(ua.local_hold());
+}
+
+TEST(a_resume_asked_while_the_hold_is_out_follows_it) {
+  FakeHost host;
+  UserAgent ua(config(), host);
+  connect_outgoing(ua, host);
+  CHECK(ua.hold(7, true, t0()) == CommandResult::Ok);
+  const auto hold = host.last();
+  const size_t sent = host.sent.size();
+  CHECK(ua.hold(7, false, t0()) == CommandResult::Ok);
+  CHECK_EQ(host.sent.size(), sent);  // one re-INVITE at a time
+  ua.on_message(respond(hold, 200, kContact, "srv", answer_sdp("recvonly")), t0());
+  const auto resume = host.last();
+  CHECK_EQ(resume.method, std::string("INVITE"));
+  CHECK(has_line(resume, "a=sendrecv"));
+  CHECK_EQ(events_of(ua, EventKind::CallHold).size(), size_t{1});
+  ua.on_message(respond(resume, 200, kContact, "srv", answer_sdp("sendrecv")), t0());
+  CHECK(!ua.local_hold());
+}
+
+TEST(reinvites_that_cross_get_a_491_and_this_side_tries_again_later) {
+  FakeHost host;
+  UserAgent ua(config(), host);
+  int32_t id = 0;
+  const std::string tag = connect_incoming(ua, host, id);
+  CHECK(ua.hold(id, true, t0()) == CommandResult::Ok);
+  const auto first = host.last();
+  CHECK_EQ(first.uri, std::string("sip:asterisk@127.0.0.1:5060"));
+  // Requests this side sends in the dialog carry its tag in From and the caller's in To.
+  CHECK(std::string(*first.header("from")).find("tag=" + tag) != std::string::npos);
+  CHECK(std::string(*first.header("to")).find("tag=caller") != std::string::npos);
+
+  // The far end's own re-INVITE crosses ours.
+  ua.on_message(with_body(in_dialog("INVITE", "hold-in", 103, tag), answer_sdp("sendrecv")), t0());
+  CHECK_EQ(host.last().status, 491);
+
+  ua.on_message(respond(first, 491, {}, ""), t0());
+  CHECK_EQ(host.last().method, std::string("ACK"));
+  CHECK(events_of(ua, EventKind::CallHold).empty());
+  // Not the side that made the call: within 2 s.
+  CHECK(ua.next_deadline().has_value());
+  CHECK(*ua.next_deadline() <= t0() + 2s);
+  ua.on_timer(t0() + 2s);
+  const auto again = host.last();
+  CHECK_EQ(again.method, std::string("INVITE"));
+  CHECK(cseq_of(again) > cseq_of(first));
+  CHECK(has_line(again, "a=sendonly"));
+  ua.on_message(respond(again, 200, kContact, "", answer_sdp("recvonly")), t0() + 2s);
+  CHECK(ua.local_hold());
+}
+
+TEST(the_caller_waits_longer_after_a_491) {
+  FakeHost host;
+  UserAgent ua(config(), host);
+  connect_outgoing(ua, host);
+  CHECK(ua.hold(7, true, t0()) == CommandResult::Ok);
+  ua.on_message(respond(host.last(), 491, {}, "srv"), t0());
+  CHECK(*ua.next_deadline() >= t0() + 2100ms);
+  CHECK(*ua.next_deadline() <= t0() + 4s);
+}
+
+TEST(a_481_or_no_answer_to_the_hold_ends_the_call) {
+  {
+    FakeHost host;
+    UserAgent ua(config(), host);
+    connect_outgoing(ua, host);
+    CHECK(ua.hold(7, true, t0()) == CommandResult::Ok);
+    ua.on_message(respond(host.last(), 481, {}, "srv"), t0());
+    const auto ended = events_of(ua, EventKind::CallEnded);
+    CHECK_EQ(ended.size(), size_t{1});
+    CHECK(ended[0].end_reason == EndReason::RemoteHangup);
+    CHECK(!ua.has_call());
+  }
+  {
+    FakeHost host;
+    UserAgent ua(config(), host);
+    connect_outgoing(ua, host);
+    CHECK(ua.hold(7, true, t0()) == CommandResult::Ok);
+    ua.on_timer(t0() + 40s);
+    CHECK_EQ(host.last().method, std::string("BYE"));
+    const auto ended = events_of(ua, EventKind::CallEnded);
+    CHECK_EQ(ended.size(), size_t{1});
+    CHECK(ended[0].end_reason == EndReason::Timeout);
+  }
+}
+
+TEST(the_far_ends_hold_is_answered_recvonly_and_reported) {
+  FakeHost host;
+  UserAgent ua(config(), host);
+  int32_t id = 0;
+  const std::string tag = connect_incoming(ua, host, id);
+
+  ua.on_message(with_body(in_dialog("INVITE", "hold-in", 103, tag), answer_sdp("sendonly")), t0());
+  const auto answer = host.last();
+  CHECK_EQ(answer.status, 200);
+  CHECK(has_line(answer, "a=recvonly"));
+  CHECK(ua.remote_hold());
+  // Music on hold plays; nothing is sent to a far end that takes nothing.
+  CHECK(!host.media.back().send);
+  CHECK(host.media.back().receive);
+  auto events = events_of(ua, EventKind::CallHold);
+  CHECK_EQ(events.size(), size_t{1});
+  CHECK(events[0].remote_hold);
+  CHECK(!events[0].local_hold);
+  CHECK(ua.send_dtmf(id, "1", 0, t0()) == CommandResult::State);
+
+  // Holding as well: the offer is inactive.
+  CHECK(ua.hold(id, true, t0()) == CommandResult::Ok);
+  const auto both = host.last();
+  CHECK(has_line(both, "a=inactive"));
+  ua.on_message(respond(both, 200, kContact, "", answer_sdp("inactive")), t0());
+  events = events_of(ua, EventKind::CallHold);
+  CHECK_EQ(events.size(), size_t{1});
+  CHECK(events[0].local_hold);
+  CHECK(events[0].remote_hold);
+
+  // Resuming while the far end still holds asks to receive only.
+  CHECK(ua.hold(id, false, t0()) == CommandResult::Ok);
+  const auto resume = host.last();
+  CHECK(has_line(resume, "a=recvonly"));
+  ua.on_message(respond(resume, 200, kContact, "", answer_sdp("sendonly")), t0());
+  CHECK(!ua.local_hold());
+  events = events_of(ua, EventKind::CallHold);
+  CHECK_EQ(events.size(), size_t{1});
+  CHECK(!events[0].local_hold);
+  CHECK(events[0].remote_hold);
+  // Music on hold still plays; nothing is sent yet.
+  CHECK(!host.media.back().send);
+  CHECK(host.media.back().receive);
+
+  // The far end resumes.
+  ua.on_message(with_body(in_dialog("INVITE", "hold-in", 104, tag), answer_sdp("sendrecv")), t0());
+  CHECK(has_line(host.last(), "a=sendrecv"));
+  CHECK(!ua.remote_hold());
+  CHECK(host.media.back().send && host.media.back().receive);
+  events = events_of(ua, EventKind::CallHold);
+  CHECK_EQ(events.size(), size_t{1});
+  CHECK(!events[0].remote_hold);
+
+  // An inactive offer is answered inactive.
+  ua.on_message(with_body(in_dialog("INVITE", "hold-in", 105, tag), answer_sdp("inactive")), t0());
+  CHECK(has_line(host.last(), "a=inactive"));
+  CHECK(ua.remote_hold());
+}
+
+TEST(a_reinvite_that_changes_nothing_keeps_the_sdp_version) {
+  FakeHost host;
+  UserAgent ua(config(), host);
+  int32_t id = 0;
+  const std::string tag = connect_incoming(ua, host, id);
+  const std::string first = host.at(host.sent.size() - 1).body;
+  ua.on_message(with_body(in_dialog("INVITE", "hold-in", 103, tag), answer_sdp("sendrecv")), t0());
+  const auto same = host.last();
+  CHECK_EQ(same.status, 200);
+  CHECK_EQ(same.body.substr(0, same.body.find("s=")), first.substr(0, first.find("s=")));
+  ua.on_message(with_body(in_dialog("INVITE", "hold-in", 104, tag), answer_sdp("sendonly")), t0());
+  const auto changed = host.last();
+  CHECK(changed.body.substr(0, changed.body.find("s=")) != first.substr(0, first.find("s=")));
+}
+
+// DTMF -------------------------------------------------------------------------------------------
+
+TEST(dtmf_goes_to_the_media_on_the_answered_telephone_event_type) {
+  FakeHost host;
+  UserAgent ua(config(), host);
+  connect_outgoing(ua, host, answer_sdp("sendrecv", 10002, 96));
+  CHECK(host.media.back().telephone_event == std::optional<uint8_t>(96));
+  CHECK(ua.send_dtmf(7, "12#*", 250, t0()) == CommandResult::Ok);
+  CHECK_EQ(host.dtmf.size(), size_t{1});
+  CHECK_EQ(host.dtmf[0].first, std::string("12#*"));
+  CHECK_EQ(host.dtmf[0].second, uint32_t{250});
+  CHECK(ua.send_dtmf(7, "", 0, t0()) == CommandResult::InvalidArgument);
+  CHECK(ua.send_dtmf(7, "1x", 0, t0()) == CommandResult::InvalidArgument);
+  CHECK(ua.send_dtmf(8, "1", 0, t0()) == CommandResult::NotFound);
+  CHECK_EQ(host.dtmf.size(), size_t{1});
+}
+
+TEST(dtmf_is_refused_when_the_far_end_named_no_telephone_event_type) {
+  FakeHost host;
+  UserAgent ua(config(), host);
+  connect_outgoing(ua, host, kAnswer);  // lists 101 without an rtpmap for it
+  CHECK(!host.media.back().telephone_event.has_value());
+  CHECK(ua.send_dtmf(7, "1", 0, t0()) == CommandResult::State);
+  CHECK(host.dtmf.empty());
+}
+
+TEST(an_answer_uses_the_offers_telephone_event_type_or_leaves_it_out) {
+  FakeHost host;
+  UserAgent ua(config(), host);
+  register_ok(ua, host);
+  ua.on_message(incoming_invite("te-1", answer_sdp("sendrecv", 10002, 97)), t0());
+  CHECK(ua.answer(events_of(ua, EventKind::CallIncoming).at(0).call_id, t0()) == CommandResult::Ok);
+  const auto ok = host.last();
+  CHECK(ok.body.find("m=audio 40000 RTP/AVP 8 97\r\n") != std::string::npos);
+  CHECK(has_line(ok, "a=rtpmap:97 telephone-event/8000"));
+  CHECK(host.media.back().telephone_event == std::optional<uint8_t>(97));
+
+  FakeHost plain_host;
+  UserAgent plain(config(), plain_host);
+  register_ok(plain, plain_host);
+  plain.on_message(incoming_invite("te-2", kAnswer), t0());
+  CHECK(plain.answer(events_of(plain, EventKind::CallIncoming).at(0).call_id, t0()) == CommandResult::Ok);
+  const auto bare = plain_host.last();
+  CHECK(bare.body.find("m=audio 40000 RTP/AVP 8\r\n") != std::string::npos);
+  CHECK(bare.body.find("telephone-event") == std::string::npos);
 }

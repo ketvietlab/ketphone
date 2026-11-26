@@ -41,7 +41,7 @@ struct UserAgentConfig {
   std::string correlation_header;
 };
 
-enum class EventKind { Registration = 1, CallIncoming, CallProgress, CallAnswered, CallEnded };
+enum class EventKind { Registration = 1, CallIncoming, CallProgress, CallAnswered, CallEnded, CallHold };
 
 enum class EndReason { None, Local, RemoteHangup, RemoteCancelled, Rejected, Timeout, MediaFailed, Shutdown };
 
@@ -53,6 +53,10 @@ struct Event {
   std::string remote;
   std::string remote_display_name;
   std::string correlation_id;
+  // CallHold: whether this side holds the call (as the far end last accepted) and whether the far
+  // end holds it (as its last offer said).
+  bool local_hold = false;
+  bool remote_hold = false;
 };
 
 // SRTP master keys and salts of one call, as exchanged in SDES crypto lines.
@@ -66,6 +70,12 @@ struct RemoteMedia {
   uint16_t port = 0;
   // Set when the call's media is SRTP.
   std::optional<MediaKeys> srtp;
+  // Whether this side sends media and plays what arrives: both stop while this side holds the call,
+  // and sending stops while the far end does not take media (its hold).
+  bool send = true;
+  bool receive = true;
+  // Payload type the far end takes RFC 4733 telephone events on; nothing when it named none.
+  std::optional<uint8_t> telephone_event;
 };
 
 // What the user agent needs from its surroundings. The engine implements it with sockets; tests
@@ -77,9 +87,17 @@ class UserAgentHost {
   virtual void send_sip(const std::string& message) = 0;
   // Opens the RTP socket for the call and returns its local port, or 0 on failure.
   virtual uint16_t open_media() = 0;
-  // Starts (or redirects) media towards the far end. Called at most after open_media. Returns false
-  // when the media cannot be secured as negotiated (SRTP keys refused); the call then ends.
+  // Starts (or redirects) media towards the far end, or changes its direction and telephone-event
+  // type. Called at most after open_media. Returns false when the media cannot be secured as
+  // negotiated (SRTP keys refused); the call then ends.
   virtual bool start_media(const RemoteMedia& remote) = 0;
+  // Queues keys for RFC 4733 events on the running media; false when the media cannot send them.
+  // The user agent has already checked the keys and that the call is up and not held.
+  virtual bool send_dtmf(std::string_view keys, uint32_t duration_ms) {
+    (void)keys;
+    (void)duration_ms;
+    return false;
+  }
   virtual void close_media() = 0;
   // The far end is ringing and sends no media of its own: play this side's ringing tone, until
   // stop_ringback. Both are called only on outgoing calls, and stop_ringback may come without a start.
@@ -108,6 +126,13 @@ class UserAgent {
   CommandResult answer(int32_t call_id, TimePoint now);
   CommandResult reject(int32_t call_id, int32_t status, TimePoint now);
   CommandResult hangup(int32_t call_id, TimePoint now);
+  // Holds (`on`) or resumes a connected call with a re-INVITE: sendonly, or inactive when the far end
+  // holds too; sendrecv (recvonly while the far end holds) to resume. The outcome is a CallHold
+  // event once the far end answered; a request while one is in flight is sent after it.
+  CommandResult hold(int32_t call_id, bool on, TimePoint now);
+  // Sends keys ("0"-"9", "*", "#", "A"-"D") as RFC 4733 events on the payload type the far end
+  // named. State when the call is not connected, is held, or the far end named no such type.
+  CommandResult send_dtmf(int32_t call_id, std::string_view keys, uint32_t duration_ms, TimePoint now);
 
   // Ends the call and unregisters. Afterwards wait for idle() before dropping the transport.
   void shutdown(TimePoint now);
@@ -122,6 +147,8 @@ class UserAgent {
 
   bool registered() const { return registration_.registered; }
   bool has_call() const { return call_.has_value(); }
+  bool local_hold() const { return call_ && call_->local_hold; }
+  bool remote_hold() const { return call_ && call_->remote_hold; }
 
   // Incoming calls need ids too; the engine shares its counter so ids never collide.
   std::function<int32_t()> allocate_call_id;
@@ -182,8 +209,29 @@ class UserAgent {
     uint16_t media_port = 0;
     uint64_t sdp_session = 0;
     uint64_t sdp_version = 1;
-    // This side's SRTP key for the call, when the call is secure.
+    // This side's SRTP key for the call, when the call is secure, and the profile its offers use:
+    // the one the far end chose, so an RTP/AVP call with keys stays RTP/AVP.
     std::vector<uint8_t> srtp_key;
+    bool savp = true;
+    // The media as last started; a hold changes its direction.
+    RemoteMedia media;
+    // The ACK of the last 2xx to an INVITE this side sent, sent again when that 2xx is.
+    std::string ack;
+    uint32_t ack_cseq = 0;
+
+    // Hold. local_hold is what the far end last accepted, want_hold what the person asked for;
+    // remote_hold is what the far end's last offer said.
+    bool local_hold = false;
+    bool want_hold = false;
+    bool remote_hold = false;
+    // The re-INVITE in flight, the hold it asks for and its offer.
+    bool reinvite_in_flight = false;
+    bool reinvite_hold = false;
+    bool reinvite_authenticated = false;
+    std::string reinvite_branch;
+    std::string reinvite_sdp;
+    // After a 491 the re-INVITE goes again at this time (RFC 3261 section 14.1).
+    std::optional<TimePoint> reinvite_retry_at;
 
     // Outgoing.
     std::string invite_uri;
@@ -198,7 +246,6 @@ class UserAgent {
     bool early_media = false;
     bool cancel_requested = false;
     bool cancel_sent = false;
-    std::string ack;
 
     // Incoming.
     std::optional<sip::Message> invite;
@@ -229,7 +276,8 @@ class UserAgent {
   // Whether a far end's offer (or answer) suits this side: PCMA, and with SRTP a usable key. The
   // chosen key is returned through `key` when SRTP is on.
   bool acceptable(const sip::AudioDescription& media, const sip::SdesCrypto** key) const;
-  // This side's SDP for the call; `answering` is the offer it answers, if any.
+  // This side's SDP for the call; `answering` is the offer it answers, if any. The version goes up
+  // only when the description differs from the last one sent (RFC 3264 section 8).
   std::string local_sdp_for(Call& call, const sip::AudioDescription* answering) const;
   RemoteMedia remote_media_for(const Call& call, const sip::AudioDescription& media,
                                const sip::SdesCrypto* key) const;
@@ -255,6 +303,11 @@ class UserAgent {
   void on_invite_final(const InviteContext& context, const sip::Message* response, TimePoint now);
   void send_ack_for_failure(const InviteContext& context, const sip::Message& response);
   void send_cancel(TimePoint now);
+  // Sends the ACK of a 2xx to an INVITE this side sent, and returns it.
+  std::string send_ack_for_success(const InviteContext& context, const sip::Message& response);
+  void send_reinvite(const std::string& authorization, TimePoint now);
+  void on_reinvite_final(const InviteContext& context, const sip::Message* response, TimePoint now);
+  void emit_hold(int32_t status);
   void send_bye(TimePoint now);
 
   void on_request(const sip::Message& request, TimePoint now);

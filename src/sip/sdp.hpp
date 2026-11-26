@@ -34,6 +34,10 @@ struct AudioDescription {
   // False for a=inactive or a=recvonly from the other side (it will not send to us), which is
   // how a hold would arrive.
   bool remote_sends = true;
+  // False for a=inactive or a=sendonly from the other side (it will not take what we send).
+  bool remote_receives = true;
+  // Payload type the other side maps to telephone-event/8000 (RFC 4733), if any.
+  std::optional<uint8_t> telephone_event;
   // The m= line's profile is RTP/SAVP rather than RTP/AVP. Asterisk's optimistic SRTP offers keys
   // under RTP/AVP, so the keys below matter more than the profile.
   bool savp = false;
@@ -55,9 +59,18 @@ struct LocalCrypto {
   std::span<const uint8_t> key;
 };
 
+// Media direction of a stream (RFC 3264 section 5.1), from the side writing the description.
+enum class Direction { SendRecv, SendOnly, RecvOnly, Inactive };
+
+Direction direction_of(bool sends, bool receives);
+std::string_view attribute_of(Direction direction);
+
 // Offer or answer for one A-law audio stream plus telephone events, ptime 20 ms, with a crypto
-// line when `crypto` is given.
+// line when `crypto` is given. `telephone_event` is the payload type to list for RFC 4733 events,
+// or nothing to leave them out (an answer to an offer without them).
 std::string build_audio_sdp(std::string_view address, uint16_t port, uint64_t session_id, uint64_t version,
-                            const std::optional<LocalCrypto>& crypto = std::nullopt);
+                            const std::optional<LocalCrypto>& crypto = std::nullopt,
+                            Direction direction = Direction::SendRecv,
+                            std::optional<uint8_t> telephone_event = kPayloadTelephoneEvent);
 
 }  // namespace ketphone::sip

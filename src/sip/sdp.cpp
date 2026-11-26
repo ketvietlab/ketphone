@@ -43,7 +43,35 @@ std::optional<SdesCrypto> parse_crypto(std::string_view value) {
   return SdesCrypto{*tag, std::move(*key)};
 }
 
+// "101 telephone-event/8000" from an a=rtpmap: line gives 101; any other encoding gives nothing.
+std::optional<uint8_t> telephone_event_of(std::string_view value) {
+  const size_t space = value.find(' ');
+  if (space == std::string_view::npos) return std::nullopt;
+  const auto payload = parse_integer<uint8_t>(value.substr(0, space));
+  if (!payload || *payload > 127 || *payload == kPayloadPcma) return std::nullopt;
+  const std::string encoding = lowercase(trim(value.substr(space + 1)));
+  if (encoding != "telephone-event/8000" && encoding != "telephone-event/8000/1") return std::nullopt;
+  return payload;
+}
+
 }  // namespace
+
+Direction direction_of(bool sends, bool receives) {
+  if (sends && receives) return Direction::SendRecv;
+  if (sends) return Direction::SendOnly;
+  if (receives) return Direction::RecvOnly;
+  return Direction::Inactive;
+}
+
+std::string_view attribute_of(Direction direction) {
+  switch (direction) {
+    case Direction::SendRecv: return "sendrecv";
+    case Direction::SendOnly: return "sendonly";
+    case Direction::RecvOnly: return "recvonly";
+    case Direction::Inactive: return "inactive";
+  }
+  return "sendrecv";
+}
 
 bool AudioDescription::offers_pcma() const {
   return std::find(payload_types.begin(), payload_types.end(), kPayloadPcma) != payload_types.end();
@@ -92,6 +120,14 @@ std::optional<AudioDescription> parse_audio(std::string_view sdp) {
       }
     } else if (type == 'a' && in_audio && audio) {
       if (value == "inactive" || value == "recvonly") audio->remote_sends = false;
+      if (value == "inactive" || value == "sendonly") audio->remote_receives = false;
+      if (value.starts_with("rtpmap:") && !audio->telephone_event) {
+        if (const auto payload = telephone_event_of(value.substr(7));
+            payload && std::find(audio->payload_types.begin(), audio->payload_types.end(), *payload) !=
+                           audio->payload_types.end()) {
+          audio->telephone_event = payload;
+        }
+      }
       if (value.starts_with("crypto:")) {
         if (auto crypto = parse_crypto(value.substr(7))) audio->crypto.push_back(std::move(*crypto));
       }
@@ -111,11 +147,18 @@ std::optional<AudioDescription> parse_audio(std::string_view sdp) {
 }
 
 std::string build_audio_sdp(std::string_view address, uint16_t port, uint64_t session_id, uint64_t version,
-                            const std::optional<LocalCrypto>& crypto) {
+                            const std::optional<LocalCrypto>& crypto, Direction direction,
+                            std::optional<uint8_t> telephone_event) {
   const std::string ip(address);
   const std::string family = ip.find(':') == std::string::npos ? "IP4" : "IP6";
-  const std::string payloads = std::to_string(kPayloadPcma) + " " + std::to_string(kPayloadTelephoneEvent);
-  const std::string event = std::to_string(kPayloadTelephoneEvent);
+  std::string payloads = std::to_string(kPayloadPcma);
+  std::string events;
+  if (telephone_event) {
+    const std::string event = std::to_string(*telephone_event);
+    payloads += " " + event;
+    events = "a=rtpmap:" + event + " telephone-event/8000\r\n"
+             "a=fmtp:" + event + " 0-16\r\n";
+  }
   const std::string profile = crypto && crypto->savp ? "RTP/SAVP" : "RTP/AVP";
   std::string keys;
   if (crypto) {
@@ -128,11 +171,9 @@ std::string build_audio_sdp(std::string_view address, uint16_t port, uint64_t se
          "c=IN " + family + " " + ip + "\r\n"
          "t=0 0\r\n"
          "m=audio " + std::to_string(port) + " " + profile + " " + payloads + "\r\n"
-         "a=rtpmap:8 PCMA/8000\r\n"
-         "a=rtpmap:" + event + " telephone-event/8000\r\n"
-         "a=fmtp:" + event + " 0-16\r\n"
+         "a=rtpmap:8 PCMA/8000\r\n" + events +
          "a=ptime:20\r\n"
-         "a=sendrecv\r\n" + keys;
+         "a=" + std::string(attribute_of(direction)) + "\r\n" + keys;
 }
 
 }  // namespace ketphone::sip

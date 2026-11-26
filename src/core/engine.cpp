@@ -211,6 +211,14 @@ class Engine final : public UserAgentHost {
     return run([this, id] { return to_result(ua_.hangup(id, Clock::now())); });
   }
 
+  ketphone_result hold(ketphone_call_id id, bool on) {
+    return run([this, id, on] { return to_result(ua_.hold(id, on, Clock::now())); });
+  }
+
+  ketphone_result send_dtmf(ketphone_call_id id, const std::string& keys, uint32_t duration_ms) {
+    return run([this, id, &keys, duration_ms] { return to_result(ua_.send_dtmf(id, keys, duration_ms, Clock::now())); });
+  }
+
   size_t capture(const int16_t* samples, size_t count) { return capture_.push(samples, count); }
 
   size_t playout(int16_t* samples, size_t count) {
@@ -281,10 +289,18 @@ class Engine final : public UserAgentHost {
     if (endpoint == endpoints.end()) return true;
     rtp_remote_ = *endpoint;
     ringback_active_ = false;  // the far end's own sound replaces the local tone
-    if (media_.active()) return true;  // a re-INVITE only moves the far end or changes its key
-    media_.start(sip::random_u32(), static_cast<uint16_t>(sip::random_u32()), sip::random_u32());
-    next_frame_ = Clock::now();
+    // A re-INVITE only moves the far end, changes its key, or holds or resumes the call.
+    if (!media_.active()) {
+      media_.start(sip::random_u32(), static_cast<uint16_t>(sip::random_u32()), sip::random_u32());
+      next_frame_ = Clock::now();
+    }
+    media_.set_telephone_event(remote.telephone_event);
+    media_.set_direction(remote.send, remote.receive);
     return true;
+  }
+
+  bool send_dtmf(std::string_view keys, uint32_t duration_ms) override {
+    return media_.queue_dtmf(keys, duration_ms);
   }
 
   void start_ringback() override {
@@ -492,6 +508,7 @@ class Engine final : public UserAgentHost {
         out.remote = event.remote.c_str();
         out.remote_display_name = event.remote_display_name.c_str();
         out.correlation_id = event.correlation_id.c_str();
+        out.hold = (event.local_hold ? KETPHONE_HOLD_LOCAL : 0u) | (event.remote_hold ? KETPHONE_HOLD_REMOTE : 0u);
         callback_(&out, context_);
       }
     }
@@ -726,6 +743,20 @@ ketphone_result ketphone_reject(ketphone_engine* engine, ketphone_call_id call_i
 
 ketphone_result ketphone_hangup(ketphone_engine* engine, ketphone_call_id call_id) {
   KETPHONE_GUARD(engine->engine->hangup(call_id));
+}
+
+ketphone_result ketphone_hold(ketphone_engine* engine, ketphone_call_id call_id) {
+  KETPHONE_GUARD(engine->engine->hold(call_id, true));
+}
+
+ketphone_result ketphone_resume(ketphone_engine* engine, ketphone_call_id call_id) {
+  KETPHONE_GUARD(engine->engine->hold(call_id, false));
+}
+
+ketphone_result ketphone_send_dtmf(ketphone_engine* engine, ketphone_call_id call_id, const char* keys,
+                                   uint32_t duration_ms) {
+  if (keys == nullptr) return KETPHONE_ERROR_INVALID_ARGUMENT;
+  KETPHONE_GUARD(engine->engine->send_dtmf(call_id, keys, duration_ms));
 }
 
 size_t ketphone_audio_capture(ketphone_engine* engine, const int16_t* samples, size_t count) {
